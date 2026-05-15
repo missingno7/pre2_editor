@@ -322,6 +322,11 @@ class Pre2EditorApp(tk.Tk):
         self.placement_draft: tuple[str, object] | None = None
         self.selected_tile_catalog_num: int | None = None
         self.pending_gate_pick: tuple[int, str] | None = None
+        # New gates need their camera/scroll target (tilemap_pos) derived after
+        # the user picks the destination endpoint. Existing gate edits should
+        # not silently rewrite camera framing, so only fresh placement slots are
+        # tracked here.
+        self.pending_gate_auto_camera_slots: set[int] = set()
         self._object_drag_state: dict[str, object] | None = None
         self.tables_detail_photo: ImageTk.PhotoImage | None = None
         self.tables_detail_tile_photos: list[ImageTk.PhotoImage] = []
@@ -2858,6 +2863,14 @@ class Pre2EditorApp(tk.Tk):
                 width=2,
                 tags=("overlay", "selection", "mechanic_preview"),
             )
+            canvas.create_text(
+                end_x * scale + 8,
+                end_y * scale - 10,
+                text=f"P{index}: {label}",
+                fill=preview_color,
+                anchor="nw",
+                tags=("overlay", "selection", "mechanic_preview"),
+            )
 
         def draw_gate_mechanic_preview(gate, index: int) -> None:
             sx, sy = self.level.tilemap_xy(gate.enter_pos)
@@ -2872,14 +2885,6 @@ class Pre2EditorApp(tk.Tk):
                 end_x * scale + 8,
                 end_y * scale - 10,
                 text=f"G{index}: destination",
-                fill=preview_color,
-                anchor="nw",
-                tags=("overlay", "selection", "mechanic_preview"),
-            )
-            canvas.create_text(
-                end_x * scale + 8,
-                end_y * scale - 10,
-                text=f"P{index}: {label}",
                 fill=preview_color,
                 anchor="nw",
                 tags=("overlay", "selection", "mechanic_preview"),
@@ -3423,6 +3428,10 @@ class Pre2EditorApp(tk.Tk):
         title_label.pack(side="left", fill="x", expand=True, anchor="w")
 
         body = ttk.Frame(shell, padding=(6, 2, 6, 3))
+        # Field rows in inspector section bodies always use grid(), even when a
+        # prose note is the first child.  Keep an explicit marker so _editor_note
+        # never guesses "pack" merely because no field row exists yet.
+        body._pre2_grid_editor_section = True
         body.columnconfigure(1, weight=1)
 
         def sync_header() -> None:
@@ -3457,7 +3466,8 @@ class Pre2EditorApp(tk.Tk):
         parent that receives them.
         """
         label = ttk.Label(parent, text=text, wraplength=420, justify="left")
-        if parent.grid_slaves():
+        grid_parent = bool(getattr(parent, "_pre2_grid_editor_section", False)) or bool(parent.grid_slaves())
+        if grid_parent:
             rows = [int(info.get("row", 0)) for child in parent.grid_slaves() for info in (child.grid_info(),)]
             row = (max(rows) + 1) if rows else 0
             label.grid(row=row, column=0, columnspan=2, sticky="ew", padx=2, pady=(2, 6))
@@ -3996,6 +4006,91 @@ class Pre2EditorApp(tk.Tk):
                 command=self._save_selected_object_as_template,
             )
             save_template.pack(fill="x", pady=(6, 0))
+        if kind in {"item", "platform", "gate", "column", "secret"}:
+            move_slot = ttk.Button(
+                bar,
+                text="Move to another slot…",
+                command=lambda k=kind, i=index: self._move_selected_object_to_slot(k, i),
+            )
+            move_slot.pack(fill="x", pady=(6, 0))
+
+    def _slot_rows_for_kind(self, kind: str):
+        if self.level is None:
+            return None
+        return {
+            "item": self.level.items,
+            "platform": self.level.platforms,
+            "gate": self.level.gates,
+            "column": self.level.columns,
+            "secret": self.level.bonuses,
+        }.get(kind)
+
+    def _clear_slot_object(self, kind: str, obj) -> None:
+        if kind == "item":
+            obj.sprite_num_raw = 0xFFFF
+            obj.x_pos = 0
+            obj.y_pos = 0
+            obj.y_delta = 0
+        elif kind == "platform":
+            obj.sprite_num_raw = 0xFFFF
+            obj.x_pos = 0
+            obj.y_pos = 0
+        elif kind == "gate":
+            obj.enter_pos = 0xFFFF
+            obj.tilemap_pos = 0xFFFF
+            obj.dst_pos = 0xFFFF
+            obj.scroll_flag = 0
+        elif kind == "column":
+            obj.tilemap_pos = 0xFFFF
+            obj.trigger_pos = 0xFFFF
+            obj.width = 0
+            obj.height = 0
+        elif kind == "secret":
+            obj.pos = 0xFFFF
+        else:
+            raise ValueError(f"Unsupported slotted object kind: {kind}")
+
+    def _move_selected_object_to_slot(self, kind: str, index: int) -> None:
+        rows = self._slot_rows_for_kind(kind)
+        if rows is None or not 0 <= index < len(rows):
+            self.status_text.set(f"Cannot move missing {kind} {index}.")
+            return
+        if self._selected_property_draft_dirty:
+            self.status_text.set("Apply or Discard staged property changes before moving this object to another slot.")
+            return
+        target_index = simpledialog.askinteger(
+            "Move to slot",
+            f"Move {kind} {index} to which slot? (0–{len(rows) - 1})",
+            initialvalue=index,
+            minvalue=0,
+            maxvalue=len(rows) - 1,
+            parent=self,
+        )
+        if target_index is None or target_index == index:
+            return
+        target_obj = rows[target_index]
+        if getattr(target_obj, "active", False):
+            overwrite = messagebox.askyesno(
+                "Overwrite occupied slot?",
+                f"Slot {target_index} already contains an active {kind}. Overwrite it?",
+                parent=self,
+            )
+            if not overwrite:
+                self.status_text.set("Slot move cancelled.")
+                return
+        self._record_undo_state()
+        rows[target_index] = copy.deepcopy(rows[index])
+        self._clear_slot_object(kind, rows[index])
+        self.selected_property_draft = None
+        self._selected_property_draft_dirty = False
+        self.selected_parsed_object = (kind, target_index)
+        if kind == "gate" and index in self.gate_focus_side:
+            self.gate_focus_side[target_index] = self.gate_focus_side.pop(index)
+        self._mark_dirty(f"Moved {kind} {index} to slot {target_index}.")
+        self._refresh_tables()
+        self._refresh_parsed_detail(kind, target_index)
+        self._redraw_level_overlays()
+        self._refresh_info()
 
     def _apply_selected_object_mutation(self, kind: str, index: int, label: str, mutator) -> None:
         # Inspector callbacks stage into a private draft.  Nothing in the level
@@ -4340,6 +4435,24 @@ class Pre2EditorApp(tk.Tk):
             else:
                 obj.enter_pos = pos
         self._apply_selected_object_mutation("gate", index, f"Changed gate {index} {endpoint} tile {axis.upper()}.", mutate)
+
+    def _set_gate_camera_tile_coord(self, index: int, axis: str, raw: str) -> None:
+        if self.level is None or not 0 <= index < len(self.level.gates):
+            raise ValueError("Gate no longer exists.")
+        gate = self._selected_property_draft_for("gate", index)
+        tx, ty = self.level.tilemap_xy(gate.tilemap_pos)
+        value = self._parse_editor_int(raw, minimum=0, maximum=255, label=f"Gate camera tile {axis.upper()}")
+        if axis == "x":
+            tx = value
+        else:
+            ty = value
+        pos = (ty << 8) | tx
+        self._apply_selected_object_mutation(
+            "gate",
+            index,
+            f"Changed gate {index} post-teleport camera tile {axis.upper()}.",
+            lambda obj: setattr(obj, "tilemap_pos", pos),
+        )
 
     def _set_column_tile_coord(self, index: int, target: str, axis: str, raw: str) -> None:
         if self.level is None or not 0 <= index < len(self.level.columns):
@@ -5140,6 +5253,11 @@ class Pre2EditorApp(tk.Tk):
             dest = self._editor_section(parent, "Destination")
             self._add_editor_spinbox(dest, "Tile X", dst_xy[0], 0, from_=0, to=255, editable=True, on_commit=lambda raw, i=index: self._set_gate_tile_coord(i, "destination", "x", raw))
             self._add_editor_spinbox(dest, "Tile Y", dst_xy[1], 1, from_=0, to=255, editable=True, on_commit=lambda raw, i=index: self._set_gate_tile_coord(i, "destination", "y", raw))
+            camera_xy = self.level.tilemap_xy(gate.tilemap_pos)
+            camera = self._editor_section(parent, "Camera after teleport")
+            self._editor_note(camera, "The game scrolls the tilemap to this origin after teleporting. New gates get an automatic destination-based suggestion; tune it here when you want exact framing.")
+            self._add_editor_spinbox(camera, "Viewport tile X", camera_xy[0], 0, from_=0, to=255, editable=True, on_commit=lambda raw, i=index: self._set_gate_camera_tile_coord(i, "x", raw))
+            self._add_editor_spinbox(camera, "Viewport tile Y", camera_xy[1], 1, from_=0, to=255, editable=True, on_commit=lambda raw, i=index: self._set_gate_camera_tile_coord(i, "y", raw))
             options = self._editor_section(parent, "Options")
             self._add_editor_spinbox(options, "Scroll flag", gate.scroll_flag, 0, from_=0, to=255, editable=True, on_commit=lambda raw, i=index: self._edit_selected_int_attr("gate", i, "scroll_flag", raw, minimum=0, maximum=255, label="Scroll flag"))
             raw = self._editor_section(parent, "Advanced / raw")
@@ -5390,6 +5508,9 @@ class Pre2EditorApp(tk.Tk):
         pos = (tile_y << 8) | tile_x
         if endpoint == "destination":
             gate.dst_pos = pos
+            if index in self.pending_gate_auto_camera_slots:
+                gate.tilemap_pos = self._suggest_gate_camera_pos(tile_x, tile_y)
+                self.pending_gate_auto_camera_slots.discard(index)
             self.gate_focus_side[index] = "destination"
         else:
             gate.enter_pos = pos
@@ -6202,6 +6323,40 @@ Raw offsets:
                 return index
         return None
 
+    def _preferred_gate_placement_slot(self) -> int | None:
+        """Prefer the shipped-game gate slot band, then fall back to any spare slot.
+
+        Original levels consistently place authored gates toward the tail of the
+        20-record gate table (G12..G19 or later subsets).  The runtime does scan
+        the whole table, but defaulting new editor-authored gates into the same
+        band makes the resulting data resemble the shipped layout and avoids
+        surprising G0 insertions.
+        """
+        if self.level is None:
+            return None
+        for index in range(12, len(self.level.gates)):
+            if not self.level.gates[index].active:
+                return index
+        return self._first_inactive_slot(self.level.gates)
+
+    def _suggest_gate_camera_pos(self, destination_x: int, destination_y: int) -> int:
+        """Pick a sensible post-teleport tilemap scroll origin.
+
+        Gate tilemap_pos is not the source tile: the game scrolls the camera to
+        this map-cell origin after teleporting.  A bad default can put the player
+        off-screen.  Shipped gates generally frame the destination with the
+        player roughly inside a 20x11 visible tile window, so use that as an
+        editor-friendly default while keeping the field editable in the gate
+        inspector for exact tuning.
+        """
+        if self.level is None:
+            return ((destination_y & 0xFF) << 8) | (destination_x & 0xFF)
+        visible_w_tiles = 20
+        visible_h_tiles = 11
+        camera_x = max(0, min(int(destination_x) - 9, max(0, self.level.width_tiles - visible_w_tiles)))
+        camera_y = max(0, min(int(destination_y) - 7, max(0, self.level.height_tiles - visible_h_tiles)))
+        return ((camera_y & 0xFF) << 8) | (camera_x & 0xFF)
+
     def _place_item_at(self, world_x: float, world_y: float) -> None:
         if self.level is None:
             return
@@ -6284,7 +6439,7 @@ Raw offsets:
     def _place_gate_at(self, tile_x: int, tile_y: int) -> None:
         if self.level is None:
             return
-        slot = self._first_inactive_slot(self.level.gates)
+        slot = self._preferred_gate_placement_slot()
         if slot is None:
             self.status_text.set("No free gate slots in this level.")
             return
@@ -6292,12 +6447,16 @@ Raw offsets:
         pos = (tile_y << 8) | tile_x
         gate = self.level.gates[slot]
         gate.enter_pos = pos
-        gate.tilemap_pos = pos
+        # Temporary value while the destination is still pending; once it is
+        # picked, _apply_gate_pick() will replace this with a destination-based
+        # post-teleport camera suggestion.
+        gate.tilemap_pos = self._suggest_gate_camera_pos(tile_x, tile_y)
         gate.dst_pos = pos
         draft_gate = self._draft_object("gate")
         gate.scroll_flag = draft_gate.scroll_flag if draft_gate is not None else 0
         self.gate_focus_side[slot] = "source"
         self.pending_gate_pick = (slot, "destination")
+        self.pending_gate_auto_camera_slots.add(slot)
         self._mark_dirty(f"Placed gate G{slot} source. Click another map tile to set its destination.")
         self._refresh_tables()
         self._select_parsed_row_without_camera("gate", slot)

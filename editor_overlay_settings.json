@@ -1,7 +1,7 @@
 {
   "animate_tiles": true,
   "front_enabled": false,
-  "grid_enabled": false,
+  "grid_enabled": true,
   "overlay_animated": false,
   "overlay_attr0": false,
   "overlay_attr1": false,
@@ -13,7 +13,7 @@
   "overlay_gates": true,
   "overlay_items": true,
   "overlay_monsters": false,
-  "overlay_physics_diagram": false,
+  "overlay_physics_diagram": true,
   "overlay_platforms": true,
   "overlay_player_start": true
 }
