@@ -1,0 +1,138 @@
+{
+  "tilesets": {
+    "b11b3f23eff4ac16": {
+      "cells": {
+        "1,10": {
+          "tile": 152
+        },
+        "1,11": {
+          "tile": 172
+        },
+        "1,12": {
+          "tile": 192
+        },
+        "10,7": {
+          "tile": 43
+        },
+        "10,8": {
+          "tile": 63
+        },
+        "11,2": {
+          "tile": 33
+        },
+        "11,3": {
+          "tile": 24
+        },
+        "11,4": {
+          "tile": 97
+        },
+        "12,2": {
+          "tile": 70
+        },
+        "12,3": {
+          "tile": 78
+        },
+        "12,4": {
+          "tile": 98
+        },
+        "13,2": {
+          "tile": 32
+        },
+        "13,3": {
+          "tile": 79
+        },
+        "13,4": {
+          "tile": 99
+        },
+        "2,10": {
+          "tile": 153
+        },
+        "2,11": {
+          "tile": 173
+        },
+        "2,12": {
+          "tile": 193
+        },
+        "2,7": {
+          "secret": {
+            "hit_count": 2,
+            "initial_tile": 126,
+            "mode": "tile_reveal",
+            "revealed_tile": 148
+          },
+          "tile": 148
+        },
+        "2,8": {
+          "secret": {
+            "hit_count": 2,
+            "initial_tile": 126,
+            "mode": "tile_reveal",
+            "revealed_tile": 168
+          },
+          "tile": 168
+        },
+        "3,10": {
+          "tile": 154
+        },
+        "3,11": {
+          "tile": 174
+        },
+        "3,12": {
+          "tile": 194
+        },
+        "3,3": {
+          "tile": 138
+        },
+        "3,4": {
+          "tile": 158
+        },
+        "3,7": {
+          "secret": {
+            "hit_count": 2,
+            "initial_tile": 126,
+            "mode": "tile_reveal",
+            "revealed_tile": 151
+          },
+          "tile": 151
+        },
+        "3,8": {
+          "secret": {
+            "hit_count": 2,
+            "initial_tile": 126,
+            "mode": "tile_reveal",
+            "revealed_tile": 171
+          },
+          "tile": 171
+        },
+        "4,3": {
+          "tile": 139
+        },
+        "4,4": {
+          "tile": 159
+        },
+        "5,3": {
+          "secret": {
+            "hit_count": 3,
+            "initial_tile": 140,
+            "mode": "small_random_bonus",
+            "revealed_tile": 140
+          },
+          "tile": 140
+        },
+        "5,4": {
+          "tile": 160
+        },
+        "9,7": {
+          "tile": 42
+        },
+        "9,8": {
+          "tile": 62
+        }
+      },
+      "height": 32,
+      "name": "Tileset b11b3f23eff4ac16",
+      "width": 32
+    }
+  },
+  "version": 1
+}

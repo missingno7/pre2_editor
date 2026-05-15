@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 from collections import Counter
 import tkinter as tk
@@ -284,8 +285,10 @@ class Pre2EditorApp(tk.Tk):
         self.resources_dir = self.project_dir / "resources"
         self.overlay_settings_path = self.project_dir / "editor_overlay_settings.json"
         self.object_templates_path = self.project_dir / "editor_object_templates.json"
+        self.tile_prefabs_path = self.project_dir / "editor_tile_prefabs.json"
         self._overlay_settings = self._load_overlay_settings()
         self.object_templates = self._load_object_templates()
+        self.tile_prefabs = self._load_tile_prefabs()
         self.level = None
         self.union_tiles = b""
         self.front_tiles = b""
@@ -321,6 +324,16 @@ class Pre2EditorApp(tk.Tk):
         self.placement_catalog_selection: tuple[str, str, object | None] | None = None
         self.placement_draft: tuple[str, object] | None = None
         self.selected_tile_catalog_num: int | None = None
+        self.selected_tile_cells: set[tuple[int, int]] = set()
+        self.selected_tile_prefab_cells: set[tuple[int, int]] = set()
+        self.tile_prefab_clipboard: dict[str, object] | None = None
+        self.tile_prefab_stamping: dict[str, object] | None = None
+        self._tile_prefab_photos: dict[tuple[int, int], ImageTk.PhotoImage] = {}
+        self._tile_prefab_ghost_items: list[int] = []
+        self._tile_prefab_ghost_photos: list[ImageTk.PhotoImage] = []
+        self._tile_prefab_place_ghost_items: list[int] = []
+        self._tile_prefab_place_ghost_photos: list[ImageTk.PhotoImage] = []
+        self._tile_prefab_place_ghost_key: tuple[object, ...] | None = None
         self.pending_gate_pick: tuple[int, str] | None = None
         # New gates need their camera/scroll target (tilemap_pos) derived after
         # the user picks the destination endpoint. Existing gate edits should
@@ -475,6 +488,62 @@ class Pre2EditorApp(tk.Tk):
             )
         except OSError as exc:
             messagebox.showwarning("Templates", f"Could not save editor object templates:\n{exc}")
+
+    def _load_tile_prefabs(self) -> dict[str, object]:
+        try:
+            payload = json.loads(self.tile_prefabs_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {"version": 1, "tilesets": {}}
+        except (OSError, json.JSONDecodeError):
+            return {"version": 1, "tilesets": {}}
+        if not isinstance(payload, dict):
+            return {"version": 1, "tilesets": {}}
+        tilesets = payload.get("tilesets")
+        if not isinstance(tilesets, dict):
+            payload["tilesets"] = {}
+        payload["version"] = 1
+        return payload
+
+    def _save_tile_prefabs(self) -> None:
+        try:
+            self.tile_prefabs_path.write_text(
+                json.dumps(self.tile_prefabs, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            messagebox.showwarning("Tile prefabs", f"Could not save editor tile prefabs:\n{exc}")
+
+    def _tileset_key(self) -> str:
+        if self.level is None:
+            return "no-level"
+        digest = hashlib.sha1()
+        for value in self.level.tile_lut:
+            digest.update(int(value).to_bytes(2, "little", signed=False))
+        start = int(self.level.tiles_blob_offset)
+        end = start + int(self.level.local_tiles_count) * 128
+        digest.update(self.level.raw[start:end])
+        return digest.hexdigest()[:16]
+
+    def _current_tileset_prefab_store(self) -> dict[str, object]:
+        key = self._tileset_key()
+        tilesets = self.tile_prefabs.setdefault("tilesets", {})
+        if not isinstance(tilesets, dict):
+            tilesets = {}
+            self.tile_prefabs["tilesets"] = tilesets
+        store = tilesets.get(key)
+        if not isinstance(store, dict):
+            store = {
+                "name": f"Tileset {key}",
+                "width": 32,
+                "height": 32,
+                "cells": {},
+            }
+            tilesets[key] = store
+        store.setdefault("width", 32)
+        store.setdefault("height", 32)
+        if not isinstance(store.get("cells"), dict):
+            store["cells"] = {}
+        return store
 
     def _overlay_setting_bool(self, key: str, default: bool) -> bool:
         value = self._overlay_settings.get(key, default)
@@ -645,10 +714,31 @@ class Pre2EditorApp(tk.Tk):
         tiles_notebook.add(front_tab, text="Front Catalog")
         tiles_notebook.add(behavior_tab, text="Tile Behavior")
 
-        self.tile_canvas = ScrollableCanvas(tile_tab, bg="#202020", width=540, height=760)
+        tile_pane = ttk.Panedwindow(tile_tab, orient="vertical")
+        self.tile_catalog_pane = tile_pane
+        tile_pane.pack(fill="both", expand=True)
+        catalog_frame = ttk.Frame(tile_pane)
+        prefab_frame = ttk.Frame(tile_pane)
+        tile_pane.add(catalog_frame, weight=3)
+        tile_pane.add(prefab_frame, weight=2)
+
+        self.tile_canvas = ScrollableCanvas(catalog_frame, bg="#202020", width=540, height=420)
         self.tile_canvas.pack(fill="both", expand=True)
         self.tile_canvas.canvas.bind("<Motion>", self._on_tile_browser_motion)
         self.tile_canvas.canvas.bind("<Button-1>", self._on_tile_browser_click)
+
+        prefab_toolbar = ttk.Frame(prefab_frame)
+        prefab_toolbar.pack(fill="x", padx=4, pady=4)
+        ttk.Button(prefab_toolbar, text="Clear prefab selection", command=self._clear_tile_prefab_selection).pack(side="left", padx=(0, 4))
+        ttk.Button(prefab_toolbar, text="Clear prefab area", command=self._clear_current_tile_prefab_area).pack(side="left")
+        self.tile_prefab_status = tk.StringVar(value="Select tiles in the level, then click here to store the block.")
+        ttk.Label(prefab_frame, textvariable=self.tile_prefab_status, wraplength=430, justify="left").pack(fill="x", padx=4, pady=(0, 4))
+        self.tile_prefab_canvas = ScrollableCanvas(prefab_frame, bg="#181818", width=540, height=260)
+        self.tile_prefab_canvas.pack(fill="both", expand=True)
+        self.tile_prefab_canvas.canvas.bind("<Motion>", self._on_tile_prefab_motion)
+        self.tile_prefab_canvas.canvas.bind("<Button-1>", self._on_tile_prefab_click)
+        self.tile_prefab_canvas.canvas.bind("<Button-3>", self._on_tile_prefab_right_click)
+        self.after_idle(self._set_tile_catalog_default_sash)
 
         self.front_tile_canvas = ScrollableCanvas(front_tab, bg="#202020", width=540, height=760)
         self.front_tile_canvas.pack(fill="both", expand=True)
@@ -656,6 +746,21 @@ class Pre2EditorApp(tk.Tk):
         self.front_tile_canvas.canvas.bind("<Button-1>", self._on_front_tile_browser_click)
 
         self._build_physics_lab_tab(behavior_tab)
+
+    def _set_tile_catalog_default_sash(self) -> None:
+        if not hasattr(self, "tile_catalog_pane"):
+            return
+        pane = self.tile_catalog_pane
+        pane.update_idletasks()
+        height = pane.winfo_height()
+        if height < 120:
+            self.after(100, self._set_tile_catalog_default_sash)
+            return
+        target = min(16 * 32 + 24, max(120, height - 160))
+        try:
+            pane.sashpos(0, target)
+        except tk.TclError:
+            pass
 
     def _build_objects_editor_tab(self, parent: ttk.Frame) -> None:
         self._build_tables_tab(parent)
@@ -883,6 +988,7 @@ class Pre2EditorApp(tk.Tk):
     def _on_editor_tool_changed(self) -> None:
         tool = self.editor_tool.get()
         self._clear_tile_place_ghost()
+        self._clear_tile_prefab_place_ghost()
         self._clear_object_place_ghost()
         if tool != "Select":
             self.pending_gate_pick = None
@@ -1468,6 +1574,10 @@ class Pre2EditorApp(tk.Tk):
             self._tile_paint_pre_edit_snapshot = None
             self.placement_catalog_selection = None
             self.placement_draft = None
+            self.selected_tile_cells.clear()
+            self.selected_tile_prefab_cells.clear()
+            self.tile_prefab_clipboard = None
+            self.tile_prefab_stamping = None
             try:
                 self.background_blob = load_background_bitmap(self.data_path, index)
             except Exception as exc:
@@ -1479,6 +1589,8 @@ class Pre2EditorApp(tk.Tk):
             self.level = None
             self.level_canvas.clear()
             self.tile_canvas.clear()
+            if hasattr(self, "tile_prefab_canvas"):
+                self.tile_prefab_canvas.clear()
             self.front_tile_canvas.clear()
             self._set_info_text(f"Failed to load level:\n\n{exc}")
             self.status_text.set(f"Load failed: {exc}")
@@ -1820,6 +1932,81 @@ class Pre2EditorApp(tk.Tk):
             self.tile_properties_apply_button.configure(state="normal")
             self.tile_properties_discard_button.configure(state="normal")
 
+    def _tile_property_target_cells(self, context: dict[str, object]) -> list[tuple[int, int]]:
+        if self.selected_tile_cells:
+            return sorted(self.selected_tile_cells)
+        map_xy = context.get("map_xy")
+        if isinstance(map_xy, tuple) and len(map_xy) == 2:
+            return [(int(map_xy[0]), int(map_xy[1]))]
+        return []
+
+    def _first_secret_index_at(self, tx: int, ty: int) -> int | None:
+        indices = self._secret_indices_for_map_xy((tx, ty))
+        return int(indices[0]) if indices else None
+
+    def _secret_desired_for_cell(self, draft: dict[str, object], tx: int, ty: int) -> tuple[int, int, int, int] | None:
+        if self.level is None:
+            return None
+        mode = str(draft.get("mode", "none"))
+        if mode == "none":
+            return None
+        tile_num = int(self.level.tile_num_at(tx, ty) or draft.get("tile_num", 0x7E)) & 0xFF
+        draft_tile = int(draft.get("tile_num", tile_num)) & 0xFF
+        initial_tile = int(draft.get("initial_tile", tile_num)) & 0xFF
+        revealed_tile = int(draft.get("revealed_tile", tile_num)) & 0xFF
+        # When a secret type is applied to a multi-selection, defaults that came
+        # from the originally inspected tile follow each target cell. Explicitly
+        # changed tile IDs stay literal.
+        if revealed_tile == draft_tile:
+            revealed_tile = tile_num
+        if mode != "tile_reveal" and initial_tile == draft_tile:
+            initial_tile = tile_num
+        count = self._tile_secret_count_byte(mode, int(draft.get("hit_count", 1)))
+        return initial_tile, revealed_tile, count, (ty << 8) | tx
+
+    def _secret_prefab_payload_at(self, tx: int, ty: int) -> dict[str, int | str] | None:
+        if self.level is None:
+            return None
+        slot = self._first_secret_index_at(tx, ty)
+        if slot is None:
+            return None
+        bonus = self.level.bonuses[slot]
+        return {
+            "mode": bonus.mode,
+            "hit_count": int(bonus.hit_count_estimate),
+            "initial_tile": int(bonus.initial_tile) & 0xFF,
+            "revealed_tile": int(bonus.revealed_tile) & 0xFF,
+        }
+
+    def _make_tile_block_from_level_selection(self) -> dict[str, object] | None:
+        if self.level is None or not self.selected_tile_cells:
+            return None
+        min_x = min(tx for tx, _ty in self.selected_tile_cells)
+        min_y = min(ty for _tx, ty in self.selected_tile_cells)
+        max_x = max(tx for tx, _ty in self.selected_tile_cells)
+        max_y = max(ty for _tx, ty in self.selected_tile_cells)
+        cells: list[dict[str, object]] = []
+        for tx, ty in sorted(self.selected_tile_cells):
+            tile_num = self.level.tile_num_at(tx, ty)
+            if tile_num is None:
+                continue
+            cell: dict[str, object] = {
+                "x": tx - min_x,
+                "y": ty - min_y,
+                "tile": int(tile_num) & 0xFF,
+            }
+            secret = self._secret_prefab_payload_at(tx, ty)
+            if secret is not None:
+                cell["secret"] = secret
+            cells.append(cell)
+        if not cells:
+            return None
+        return {
+            "width": max_x - min_x + 1,
+            "height": max_y - min_y + 1,
+            "cells": cells,
+        }
+
     def _apply_tile_properties_drafts(self) -> None:
         """Commit the whole Tile + Secret inspector as one editor action.
 
@@ -1833,58 +2020,62 @@ class Pre2EditorApp(tk.Tk):
             return
 
         context = self.selected_tile_context
+        target_cells = self._tile_property_target_cells(context)
         behavior_draft = self.selected_tile_behavior_draft
         behavior_changed = False
-        tile_num = None
+        behavior_tile_nums: list[int] = []
         behavior_staged: tuple[int, int, int, int] | None = None
         if behavior_draft is not None:
-            tile_num = int(behavior_draft["tile_num"])
-            behavior_current = (
-                int(self.level.tile_attributes0[tile_num]),
-                int(self.level.tile_attributes1[tile_num]),
-                int(self.level.tile_attributes2[tile_num]),
-                int(self.level.tile_attributes3[tile_num]),
-            )
             behavior_staged = (
                 int(behavior_draft["attr0"]),
                 int(behavior_draft["attr1"]),
                 int(behavior_draft["attr2"]),
                 int(behavior_draft["attr3"]),
             )
-            behavior_changed = behavior_current != behavior_staged
+            if target_cells:
+                behavior_tile_nums = sorted({
+                    int(self.level.tile_num_at(tx, ty) or 0) & 0xFF
+                    for tx, ty in target_cells
+                })
+            else:
+                behavior_tile_nums = [int(behavior_draft["tile_num"]) & 0xFF]
+            behavior_changed = any(
+                (
+                    int(self.level.tile_attributes0[tile_num]),
+                    int(self.level.tile_attributes1[tile_num]),
+                    int(self.level.tile_attributes2[tile_num]),
+                    int(self.level.tile_attributes3[tile_num]),
+                ) != behavior_staged
+                for tile_num in behavior_tile_nums
+            )
 
         secret_draft = self._ensure_tile_secret_draft(context)
-        map_xy = secret_draft.get("map_xy")
         secret_changed = False
         secret_mode = str(secret_draft.get("mode", "none"))
-        secret_slot = secret_draft.get("slot")
-        secret_slot_index = int(secret_slot) if secret_slot is not None else None
-        secret_tilemap_pos = None
-        secret_desired: tuple[int, int, int, int] | None = None
-        secret_create_slot: int | None = None
-        if isinstance(map_xy, tuple) and len(map_xy) == 2:
-            tx, ty = int(map_xy[0]), int(map_xy[1])
-            secret_tilemap_pos = (ty << 8) | tx
-            if secret_mode == "none":
-                secret_changed = secret_slot_index is not None
-            else:
-                if secret_slot_index is None:
-                    free_slot = self._first_inactive_slot(self.level.bonuses)
-                    if free_slot is None:
-                        self.status_text.set("No free secret / bonus slots remain in this level.")
-                        self._update_tile_properties_action_bar()
-                        return
-                    secret_create_slot = int(free_slot)
-                    compare_slot = secret_create_slot
-                else:
-                    compare_slot = secret_slot_index
-                count = self._tile_secret_count_byte(secret_mode, int(secret_draft.get("hit_count", 1)))
-                initial_tile = int(secret_draft.get("initial_tile", secret_draft.get("tile_num", 0x7E))) & 0xFF
-                revealed_tile = int(secret_draft.get("revealed_tile", secret_draft.get("tile_num", 0x7E))) & 0xFF
-                secret_desired = (initial_tile, revealed_tile, count, int(secret_tilemap_pos))
-                bonus = self.level.bonuses[compare_slot]
-                secret_current = (int(bonus.tile_num0), int(bonus.tile_num1), int(bonus.count), int(bonus.pos))
-                secret_changed = secret_current != secret_desired or secret_slot_index is None
+        secret_actions: list[tuple[int, int, int | None, tuple[int, int, int, int] | None]] = []
+        if self._selected_tile_secret_draft_dirty and target_cells:
+            for tx, ty in target_cells:
+                slot_index = self._first_secret_index_at(tx, ty)
+                desired = self._secret_desired_for_cell(secret_draft, tx, ty)
+                if secret_mode == "none":
+                    if slot_index is not None:
+                        secret_actions.append((tx, ty, slot_index, None))
+                elif desired is not None:
+                    if slot_index is None:
+                        secret_actions.append((tx, ty, None, desired))
+                    else:
+                        bonus = self.level.bonuses[slot_index]
+                        current = (int(bonus.tile_num0), int(bonus.tile_num1), int(bonus.count), int(bonus.pos))
+                        if current != desired:
+                            secret_actions.append((tx, ty, slot_index, desired))
+            secret_changed = bool(secret_actions)
+            free_needed = sum(1 for _tx, _ty, slot, desired in secret_actions if slot is None and desired is not None)
+            if free_needed:
+                free_slots = sum(1 for bonus in self.level.bonuses if not bonus.active)
+                if free_slots < free_needed:
+                    self.status_text.set("No free secret / bonus slots remain in this level.")
+                    self._update_tile_properties_action_bar()
+                    return
         elif self._selected_tile_secret_draft_dirty:
             self.status_text.set("Secret mechanics can only be attached to a concrete map cell.")
             self._update_tile_properties_action_bar()
@@ -1900,13 +2091,15 @@ class Pre2EditorApp(tk.Tk):
         self._record_undo_state()
         applied_parts: list[str] = []
 
-        if behavior_changed and tile_num is not None and behavior_staged is not None:
-            self.level.tile_attributes0 = self._replace_attribute_byte(self.level.tile_attributes0, tile_num, behavior_staged[0])
-            self.level.tile_attributes1 = self._replace_attribute_byte(self.level.tile_attributes1, tile_num, behavior_staged[1])
-            self.level.tile_attributes2 = self._replace_attribute_byte(self.level.tile_attributes2, tile_num, behavior_staged[2])
-            self.level.tile_attributes3 = self._replace_attribute_byte(self.level.tile_attributes3, tile_num, behavior_staged[3])
+        if behavior_changed and behavior_tile_nums and behavior_staged is not None:
+            for tile_num in behavior_tile_nums:
+                self.level.tile_attributes0 = self._replace_attribute_byte(self.level.tile_attributes0, tile_num, behavior_staged[0])
+                self.level.tile_attributes1 = self._replace_attribute_byte(self.level.tile_attributes1, tile_num, behavior_staged[1])
+                self.level.tile_attributes2 = self._replace_attribute_byte(self.level.tile_attributes2, tile_num, behavior_staged[2])
+                self.level.tile_attributes3 = self._replace_attribute_byte(self.level.tile_attributes3, tile_num, behavior_staged[3])
+            primary_tile = int(behavior_draft["tile_num"]) & 0xFF if behavior_draft is not None else behavior_tile_nums[0]
             self.selected_tile_behavior_draft = {
-                "tile_num": tile_num,
+                "tile_num": primary_tile,
                 "attr0": behavior_staged[0],
                 "attr1": behavior_staged[1],
                 "attr2": behavior_staged[2],
@@ -1919,22 +2112,30 @@ class Pre2EditorApp(tk.Tk):
                 "attr3": behavior_staged[3],
             })
             self._load_physics_lab_values(*behavior_staged)
-            applied_parts.append(f"tile 0x{tile_num:02X} behavior")
+            if len(behavior_tile_nums) == 1:
+                applied_parts.append(f"tile 0x{behavior_tile_nums[0]:02X} behavior")
+            else:
+                applied_parts.append(f"{len(behavior_tile_nums)} tile definitions")
 
-        if secret_changed and isinstance(map_xy, tuple) and len(map_xy) == 2:
-            tx, ty = int(map_xy[0]), int(map_xy[1])
-            if secret_mode == "none" and secret_slot_index is not None:
-                self.level.bonuses[secret_slot_index].pos = 0xFFFF
-                applied_parts.append(f"removed secret S{secret_slot_index} at ({tx}, {ty})")
-            elif secret_mode != "none" and secret_desired is not None:
-                write_slot = secret_slot_index if secret_slot_index is not None else secret_create_slot
-                assert write_slot is not None
+        if secret_changed:
+            changed_secret_count = 0
+            for tx, ty, slot_index, desired in secret_actions:
+                if desired is None and slot_index is not None:
+                    self.level.bonuses[slot_index].pos = 0xFFFF
+                    changed_secret_count += 1
+                    continue
+                if desired is None:
+                    continue
+                write_slot = slot_index
+                if write_slot is None:
+                    free_slot = self._first_inactive_slot(self.level.bonuses)
+                    if free_slot is None:
+                        continue
+                    write_slot = int(free_slot)
                 bonus = self.level.bonuses[int(write_slot)]
-                bonus.tile_num0, bonus.tile_num1, bonus.count, bonus.pos = secret_desired
-                applied_parts.append(
-                    ("updated" if secret_slot_index is not None else "added")
-                    + f" secret S{int(write_slot)} at ({tx}, {ty})"
-                )
+                bonus.tile_num0, bonus.tile_num1, bonus.count, bonus.pos = desired
+                changed_secret_count += 1
+            applied_parts.append(f"{changed_secret_count} secret mechanic cells")
 
         self._selected_tile_behavior_draft_dirty = False
         self.selected_tile_secret_draft = self._build_tile_secret_draft(context)
@@ -2540,6 +2741,7 @@ class Pre2EditorApp(tk.Tk):
     def _rerender_all(self) -> None:
         self._rerender_level()
         self._rerender_tiles()
+        self._rerender_tile_prefabs()
         self._rerender_front_tiles()
         self._refresh_info()
         self._refresh_tables()
@@ -3255,6 +3457,16 @@ class Pre2EditorApp(tk.Tk):
                 px, py = boss.x_pos * scale, boss.y_pos * scale
                 canvas.create_oval(px - 18, py - 18, px + 18, py + 18, outline=selection_color, width=3, tags=("overlay", "selection"))
                 canvas.create_text(px + 20, py - 18, text="Selected boss", fill=selection_color, anchor="nw", tags=("overlay", "selection"))
+
+        if self.selected_tile_cells:
+            for tx, ty in sorted(self.selected_tile_cells):
+                x0, y0 = tx * 16, ty * 16
+                rect_world(x0, y0, x0 + 16, y0 + 16, outline="#FFD34D", fill="", width=3)
+            min_x = min(tx for tx, _ty in self.selected_tile_cells)
+            min_y = min(ty for _tx, ty in self.selected_tile_cells)
+            max_x = max(tx for tx, _ty in self.selected_tile_cells)
+            max_y = max(ty for _tx, ty in self.selected_tile_cells)
+            rect_world(min_x * 16, min_y * 16, (max_x + 1) * 16, (max_y + 1) * 16, outline="#7CFFB2", fill="", width=2)
 
         if self.grid_enabled.get():
             for x in range(0, map_w + 1, tile_px):
@@ -6048,6 +6260,8 @@ Raw offsets:
     def _begin_tile_paint_stroke(self, event, *, erase: bool) -> bool:
         if self.level is None or self.editor_tool.get() != "Place" or self._active_level_editor_tab() != "Tiles":
             return False
+        if self.tile_prefab_stamping is not None:
+            return False
         if not erase and self.selected_tile_catalog_num is None:
             self.status_text.set("Pick a tile from Tile Catalog first; then drag on the level to paint it.")
             if hasattr(self, "tiles_tool_tabs"):
@@ -6215,13 +6429,20 @@ Raw offsets:
         return True
 
     def _on_level_right_press(self, event) -> None:
+        if self.editor_tool.get() == "Select" and self._active_level_editor_tab() == "Tiles":
+            self._clear_selected_tile_cells()
+            return
         self._begin_tile_paint_stroke(event, erase=True)
 
     def _on_level_right_drag(self, event) -> None:
+        if self.editor_tool.get() == "Select" and self._active_level_editor_tab() == "Tiles":
+            return
         self._paint_tile_stroke_at_event(event)
         self._on_level_motion(event)
 
     def _on_level_right_release(self, _event) -> None:
+        if self.editor_tool.get() == "Select" and self._active_level_editor_tab() == "Tiles":
+            return
         self._finish_tile_paint_stroke()
 
     def _on_level_press(self, event) -> None:
@@ -6482,7 +6703,82 @@ Raw offsets:
         self._refresh_tables()
         self._select_parsed_row_without_camera("gate", slot)
 
+    def _write_prefab_secret_at(self, tx: int, ty: int, payload: object) -> bool:
+        if self.level is None or not isinstance(payload, dict):
+            return False
+        mode = str(payload.get("mode", "none"))
+        if mode == "none":
+            return False
+        slot = self._first_secret_index_at(tx, ty)
+        if slot is None:
+            slot = self._first_inactive_slot(self.level.bonuses)
+            if slot is None:
+                return False
+        count = self._tile_secret_count_byte(mode, int(payload.get("hit_count", 1)))
+        bonus = self.level.bonuses[int(slot)]
+        bonus.tile_num0 = int(payload.get("initial_tile", self.level.tile_num_at(tx, ty) or 0x7E)) & 0xFF
+        bonus.tile_num1 = int(payload.get("revealed_tile", self.level.tile_num_at(tx, ty) or 0x7E)) & 0xFF
+        bonus.count = count
+        bonus.pos = (ty << 8) | tx
+        return True
+
+    def _clear_prefab_secrets_at(self, tx: int, ty: int) -> int:
+        if self.level is None:
+            return 0
+        cleared = 0
+        for slot in self._secret_indices_for_map_xy((tx, ty)):
+            self.level.bonuses[int(slot)].pos = 0xFFFF
+            cleared += 1
+        return cleared
+
+    def _stamp_tile_block_at(self, block: dict[str, object], tile_x: int, tile_y: int) -> bool:
+        if self.level is None:
+            return False
+        cells = block.get("cells", [])
+        if not isinstance(cells, list):
+            return False
+        self._record_undo_state()
+        tilemap = bytearray(self.level.tilemap)
+        changed_tiles = 0
+        changed_secrets = 0
+        touched_chunks: set[tuple[int, int]] = set()
+        for raw_cell in cells:
+            if not isinstance(raw_cell, dict):
+                continue
+            tx = tile_x + int(raw_cell.get("x", 0))
+            ty = tile_y + int(raw_cell.get("y", 0))
+            if not (0 <= tx < self.level.width_tiles and 0 <= ty < self.level.height_tiles):
+                continue
+            offset = ty * self.level.width_tiles + tx
+            tile_num = int(raw_cell.get("tile", 0)) & 0xFF
+            if tilemap[offset] != tile_num:
+                tilemap[offset] = tile_num
+                changed_tiles += 1
+            cleared = self._clear_prefab_secrets_at(tx, ty)
+            if cleared:
+                changed_secrets += cleared
+            if "secret" in raw_cell and self._write_prefab_secret_at(tx, ty, raw_cell.get("secret")):
+                changed_secrets += 1
+            touched_chunks.add(self._tile_chunk_key(tx, ty))
+        if changed_tiles == 0 and changed_secrets == 0:
+            if self.undo_stack:
+                self.undo_stack.pop()
+            self.status_text.set("Prefab stamp made no changes.")
+            return True
+        self.level.tilemap = bytes(tilemap)
+        self._dirty_level_chunks.update(touched_chunks)
+        self._flush_dirty_level_chunks()
+        self._mark_dirty(f"Stamped tile prefab: {changed_tiles} tiles, {changed_secrets} secrets.")
+        self._refresh_info()
+        self._redraw_level_overlays()
+        return True
+
     def _place_tile_at_event(self, event) -> bool:
+        if self.tile_prefab_stamping is not None:
+            coords = self._level_coords_from_event(event)
+            if coords is None:
+                return True
+            return self._stamp_tile_block_at(self.tile_prefab_stamping, coords[0], coords[1])
         if self.level is None or self.selected_tile_catalog_num is None:
             self.status_text.set("Pick a tile from Tile Catalog before using the tile paint brush.")
             if hasattr(self, "tiles_tool_tabs"):
@@ -6964,7 +7260,15 @@ Raw offsets:
             self._refresh_parsed_detail(kind, index)
             self._redraw_level_overlays()
 
-    def _show_tile_properties(self, tile_num: int, *, map_xy: tuple[int, int] | None = None, source: str = "Level") -> None:
+    def _select_tiles_tool_tab(self, label: str) -> None:
+        if not hasattr(self, "tiles_tool_tabs"):
+            return
+        for tab_id in self.tiles_tool_tabs.tabs():
+            if self.tiles_tool_tabs.tab(tab_id, "text") == label:
+                self.tiles_tool_tabs.select(tab_id)
+                return
+
+    def _show_tile_properties(self, tile_num: int, *, map_xy: tuple[int, int] | None = None, source: str = "Level", focus_behavior_tab: bool = True) -> None:
         if self.level is None:
             return
         lut = self.level.lut_value(tile_num)
@@ -6989,8 +7293,28 @@ Raw offsets:
         self._refresh_tile_properties_form(self.selected_tile_context)
         self.main_notebook.select(self.level_viewer_tab)
         self.level_side_notebook.select(self.tiles_editor_tab)
-        if hasattr(self, "tiles_tool_tabs"):
-            self.tiles_tool_tabs.select(2)
+        if focus_behavior_tab:
+            self._select_tiles_tool_tab("Tile Behavior")
+
+    def _clear_selected_tile_cells(self) -> None:
+        self.selected_tile_cells.clear()
+        self.tile_prefab_clipboard = None
+        self._clear_tile_prefab_ghost()
+        self.status_text.set("Tile selection cleared.")
+        self._redraw_level_overlays()
+        if hasattr(self, "tile_prefab_status"):
+            self.tile_prefab_status.set("Select tiles in the level, then click the prefab canvas to store that block.")
+
+    def _refresh_tile_clipboard_from_selection(self) -> None:
+        self.tile_prefab_clipboard = self._make_tile_block_from_level_selection()
+        if hasattr(self, "tile_prefab_status"):
+            if self.tile_prefab_clipboard is None:
+                self.tile_prefab_status.set("Select tiles in the level, then click the prefab canvas to store that block.")
+            else:
+                width = int(self.tile_prefab_clipboard.get("width", 1))
+                height = int(self.tile_prefab_clipboard.get("height", 1))
+                count = len(self.tile_prefab_clipboard.get("cells", []))
+                self.tile_prefab_status.set(f"Level selection: {count} tiles, {width}x{height}. Click the prefab area to store it.")
 
     def _select_level_tile(self, event) -> None:
         if self._active_level_editor_tab() == "Objects" and self.editor_tool.get() == "Select":
@@ -7011,8 +7335,248 @@ Raw offsets:
             f"{physics}; raw attrs [0]={attr0:02X} [1]={attr1:02X} [2]={attr2:02X} [3]={attr3:02X}"
         )
         self.selected_parsed_object = None
-        self._show_tile_properties(tile_num, map_xy=(tx, ty), source="Level")
+        focus_behavior_tab = True
+        if self.editor_tool.get() == "Select" and self._active_level_editor_tab() == "Tiles":
+            shift_down = bool(getattr(event, "state", 0) & 0x0001)
+            focus_behavior_tab = not shift_down
+            if not shift_down:
+                self.selected_tile_cells = {(tx, ty)}
+            elif (tx, ty) in self.selected_tile_cells:
+                self.selected_tile_cells.remove((tx, ty))
+            else:
+                self.selected_tile_cells.add((tx, ty))
+            self._refresh_tile_clipboard_from_selection()
+        self._show_tile_properties(tile_num, map_xy=(tx, ty), source="Level", focus_behavior_tab=focus_behavior_tab)
         self._redraw_level_overlays()
+
+    def _tile_prefab_cell_key(self, x: int, y: int) -> str:
+        return f"{int(x)},{int(y)}"
+
+    def _tile_prefab_coords_from_event(self, event) -> tuple[int, int] | None:
+        if not hasattr(self, "tile_prefab_canvas"):
+            return None
+        canvas = self.tile_prefab_canvas.canvas
+        cell_px = 32
+        x = int(canvas.canvasx(event.x)) // cell_px
+        y = int(canvas.canvasy(event.y)) // cell_px
+        store = self._current_tileset_prefab_store()
+        width = int(store.get("width", 32))
+        height = int(store.get("height", 32))
+        if 0 <= x < width and 0 <= y < height:
+            return x, y
+        return None
+
+    def _prefab_cell_payload(self, x: int, y: int) -> dict[str, object] | None:
+        store = self._current_tileset_prefab_store()
+        cells = store.get("cells")
+        if not isinstance(cells, dict):
+            return None
+        payload = cells.get(self._tile_prefab_cell_key(x, y))
+        return payload if isinstance(payload, dict) else None
+
+    def _make_tile_block_from_prefab_selection(self) -> dict[str, object] | None:
+        if not self.selected_tile_prefab_cells:
+            return None
+        min_x = min(x for x, _y in self.selected_tile_prefab_cells)
+        min_y = min(y for _x, y in self.selected_tile_prefab_cells)
+        max_x = max(x for x, _y in self.selected_tile_prefab_cells)
+        max_y = max(y for _x, y in self.selected_tile_prefab_cells)
+        cells: list[dict[str, object]] = []
+        for x, y in sorted(self.selected_tile_prefab_cells):
+            payload = self._prefab_cell_payload(x, y)
+            if payload is None:
+                continue
+            cell: dict[str, object] = {
+                "x": x - min_x,
+                "y": y - min_y,
+                "tile": int(payload.get("tile", 0)) & 0xFF,
+            }
+            secret = payload.get("secret")
+            if isinstance(secret, dict):
+                cell["secret"] = dict(secret)
+            cells.append(cell)
+        if not cells:
+            return None
+        return {"width": max_x - min_x + 1, "height": max_y - min_y + 1, "cells": cells}
+
+    def _tile_catalog_block(self) -> dict[str, object] | None:
+        if self.selected_tile_catalog_num is None:
+            return None
+        return {
+            "width": 1,
+            "height": 1,
+            "cells": [{"x": 0, "y": 0, "tile": int(self.selected_tile_catalog_num) & 0xFF}],
+        }
+
+    def _tile_prefab_insert_block(self) -> dict[str, object] | None:
+        if self.tile_prefab_clipboard is not None:
+            return self.tile_prefab_clipboard
+        if self.editor_tool.get() == "Place":
+            return self._tile_catalog_block()
+        return None
+
+    def _store_tile_block_in_prefabs(self, block: dict[str, object], dest_x: int, dest_y: int) -> None:
+        store = self._current_tileset_prefab_store()
+        cells = store.setdefault("cells", {})
+        if not isinstance(cells, dict):
+            cells = {}
+            store["cells"] = cells
+        width = int(store.get("width", 32))
+        height = int(store.get("height", 32))
+        written = 0
+        for raw_cell in block.get("cells", []):
+            if not isinstance(raw_cell, dict):
+                continue
+            x = dest_x + int(raw_cell.get("x", 0))
+            y = dest_y + int(raw_cell.get("y", 0))
+            if not (0 <= x < width and 0 <= y < height):
+                continue
+            payload: dict[str, object] = {"tile": int(raw_cell.get("tile", 0)) & 0xFF}
+            secret = raw_cell.get("secret")
+            if isinstance(secret, dict):
+                payload["secret"] = dict(secret)
+            cells[self._tile_prefab_cell_key(x, y)] = payload
+            written += 1
+        self._save_tile_prefabs()
+        self._rerender_tile_prefabs()
+        self.status_text.set(f"Stored {written} prefab tile cells for this tileset.")
+
+    def _clear_tile_prefab_ghost(self) -> None:
+        if not hasattr(self, "tile_prefab_canvas"):
+            return
+        canvas = self.tile_prefab_canvas.canvas
+        for item in self._tile_prefab_ghost_items:
+            canvas.delete(item)
+        self._tile_prefab_ghost_items.clear()
+        self._tile_prefab_ghost_photos.clear()
+
+    def _draw_tile_block_ghost_on_prefab_canvas(self, block: dict[str, object], dest_x: int, dest_y: int) -> None:
+        self._clear_tile_prefab_ghost()
+        if self.level is None or not self.union_tiles:
+            return
+        canvas = self.tile_prefab_canvas.canvas
+        cell_px = 32
+        for raw_cell in block.get("cells", []):
+            if not isinstance(raw_cell, dict):
+                continue
+            x = dest_x + int(raw_cell.get("x", 0))
+            y = dest_y + int(raw_cell.get("y", 0))
+            tile_num = int(raw_cell.get("tile", 0)) & 0xFF
+            tile = render_tile_image(
+                self.level,
+                self.union_tiles,
+                self.palettes[self.current_level_index],
+                tile_num,
+                scale=2,
+                transparent_zero=True,
+            ).convert("RGBA")
+            alpha = tile.getchannel("A").point(lambda value: min(value, 145))
+            tile.putalpha(alpha)
+            photo = ImageTk.PhotoImage(tile)
+            self._tile_prefab_ghost_photos.append(photo)
+            self._tile_prefab_ghost_items.append(canvas.create_image(x * cell_px, y * cell_px, image=photo, anchor="nw", tags=("prefab_ghost",)))
+            self._tile_prefab_ghost_items.append(canvas.create_rectangle(x * cell_px, y * cell_px, (x + 1) * cell_px, (y + 1) * cell_px, outline="#FFD34D", width=2, tags=("prefab_ghost",)))
+
+    def _rerender_tile_prefabs(self) -> None:
+        if not hasattr(self, "tile_prefab_canvas") or self.level is None or not self.union_tiles:
+            return
+        store = self._current_tileset_prefab_store()
+        width = int(store.get("width", 32))
+        height = int(store.get("height", 32))
+        cell_px = 32
+        canvas = self.tile_prefab_canvas.canvas
+        canvas.delete("all")
+        self._tile_prefab_photos.clear()
+        canvas.configure(scrollregion=(0, 0, width * cell_px, height * cell_px))
+        for y in range(height):
+            for x in range(width):
+                fill = "#202020" if (x + y) % 2 else "#1A1A1A"
+                canvas.create_rectangle(x * cell_px, y * cell_px, (x + 1) * cell_px, (y + 1) * cell_px, fill=fill, outline="#303030", tags=("prefab_grid",))
+        cells = store.get("cells")
+        if isinstance(cells, dict):
+            for key, payload in cells.items():
+                if not isinstance(payload, dict):
+                    continue
+                try:
+                    x_raw, y_raw = str(key).split(",", 1)
+                    x, y = int(x_raw), int(y_raw)
+                except ValueError:
+                    continue
+                if not (0 <= x < width and 0 <= y < height):
+                    continue
+                tile_num = int(payload.get("tile", 0)) & 0xFF
+                tile = render_tile_image(self.level, self.union_tiles, self.palettes[self.current_level_index], tile_num, scale=2, transparent_zero=True)
+                photo = ImageTk.PhotoImage(tile)
+                self._tile_prefab_photos[(x, y)] = photo
+                canvas.create_image(x * cell_px, y * cell_px, image=photo, anchor="nw", tags=("prefab_tile",))
+                if isinstance(payload.get("secret"), dict):
+                    canvas.create_rectangle(x * cell_px + 3, y * cell_px + 3, (x + 1) * cell_px - 3, (y + 1) * cell_px - 3, outline="#6CCBFF", width=2, tags=("prefab_tile",))
+        for x, y in sorted(self.selected_tile_prefab_cells):
+            canvas.create_rectangle(x * cell_px + 1, y * cell_px + 1, (x + 1) * cell_px - 1, (y + 1) * cell_px - 1, outline="#FFD34D", width=3, tags=("prefab_selection",))
+
+    def _on_tile_prefab_motion(self, event) -> None:
+        coords = self._tile_prefab_coords_from_event(event)
+        if coords is None:
+            self._clear_tile_prefab_ghost()
+            return
+        x, y = coords
+        insert_block = self._tile_prefab_insert_block()
+        if insert_block is not None:
+            self._draw_tile_block_ghost_on_prefab_canvas(insert_block, x, y)
+        payload = self._prefab_cell_payload(x, y)
+        if payload is not None:
+            self.tile_info_text.set(f"Prefab ({x}, {y}) -> tile 0x{int(payload.get('tile', 0)) & 0xFF:02X}")
+
+    def _on_tile_prefab_click(self, event) -> None:
+        coords = self._tile_prefab_coords_from_event(event)
+        if coords is None:
+            return
+        x, y = coords
+        insert_block = self._tile_prefab_insert_block()
+        if insert_block is not None:
+            self._store_tile_block_in_prefabs(insert_block, x, y)
+            return
+        if (x, y) in self.selected_tile_prefab_cells:
+            self.selected_tile_prefab_cells.remove((x, y))
+        elif self._prefab_cell_payload(x, y) is not None:
+            self.selected_tile_prefab_cells.add((x, y))
+        self.tile_prefab_stamping = self._make_tile_block_from_prefab_selection()
+        if self.tile_prefab_stamping is not None:
+            self.editor_tool.set("Place")
+            self._on_editor_tool_changed()
+        self._rerender_tile_prefabs()
+        if self.tile_prefab_stamping is None:
+            self.tile_prefab_status.set("Select tiles in the level, then click here to store the block.")
+        else:
+            count = len(self.tile_prefab_stamping.get("cells", []))
+            self.tile_prefab_status.set(f"Prefab selection: {count} tiles. Switch to Place and click the level to stamp it.")
+
+    def _on_tile_prefab_right_click(self, _event) -> None:
+        self._clear_tile_prefab_selection()
+
+    def _clear_tile_prefab_selection(self) -> None:
+        self.selected_tile_prefab_cells.clear()
+        self.tile_prefab_stamping = None
+        self.tile_prefab_clipboard = None
+        self.selected_tile_catalog_num = None
+        self._redraw_tile_catalog_selection()
+        self._clear_tile_prefab_ghost()
+        self._rerender_tile_prefabs()
+        if hasattr(self, "tile_prefab_status"):
+            self.tile_prefab_status.set("Prefab selection cleared.")
+
+    def _clear_current_tile_prefab_area(self) -> None:
+        if self.level is None:
+            return
+        if not messagebox.askyesno("Clear tile prefabs", "Clear the prefab canvas for this tileset?"):
+            return
+        store = self._current_tileset_prefab_store()
+        store["cells"] = {}
+        self.selected_tile_prefab_cells.clear()
+        self.tile_prefab_stamping = None
+        self._save_tile_prefabs()
+        self._rerender_tile_prefabs()
+        self.status_text.set("Cleared tile prefab canvas for this tileset.")
 
     def _front_tile_index_from_canvas(self, event) -> int | None:
         x = int(self.front_tile_canvas.canvas.canvasx(event.x))
@@ -7054,12 +7618,95 @@ Raw offsets:
         if self.level_canvas.canvas.find_withtag("overlay"):
             self.level_canvas.canvas.tag_lower(self._tile_place_ghost_item, "overlay")
 
+    def _clear_tile_prefab_place_ghost(self) -> None:
+        if not hasattr(self, "level_canvas"):
+            return
+        canvas = self.level_canvas.canvas
+        for item in self._tile_prefab_place_ghost_items:
+            canvas.delete(item)
+        self._tile_prefab_place_ghost_items.clear()
+        self._tile_prefab_place_ghost_photos.clear()
+        self._tile_prefab_place_ghost_key = None
+
+    def _ensure_tile_prefab_place_ghost_above_map(self) -> None:
+        if not self._tile_prefab_place_ghost_items:
+            return
+        canvas = self.level_canvas.canvas
+        for item in self._tile_prefab_place_ghost_items:
+            canvas.tag_raise(item)
+            if canvas.find_withtag("overlay"):
+                canvas.tag_lower(item, "overlay")
+
+    def _update_tile_prefab_place_ghost(self, event) -> None:
+        if (
+            event is None
+            or self.level is None
+            or not self.union_tiles
+            or self.editor_tool.get() != "Place"
+            or self._active_level_editor_tab() != "Tiles"
+            or self.tile_prefab_stamping is None
+        ):
+            self._clear_tile_prefab_place_ghost()
+            return
+        coords = self._level_coords_from_event(event)
+        if coords is None:
+            self._clear_tile_prefab_place_ghost()
+            return
+        tx, ty = coords
+        scale = max(1, self.zoom.get())
+        cells = self.tile_prefab_stamping.get("cells", [])
+        visual_key = tuple(
+            (int(cell.get("x", 0)), int(cell.get("y", 0)), int(cell.get("tile", 0)) & 0xFF, bool(cell.get("secret")))
+            for cell in cells
+            if isinstance(cell, dict)
+        ) if isinstance(cells, list) else ()
+        key = (tx, ty, scale, visual_key)
+        if self._tile_prefab_place_ghost_key == key and self._tile_prefab_place_ghost_items:
+            return
+        self._clear_tile_prefab_place_ghost()
+        canvas = self.level_canvas.canvas
+        tile_px = 16 * scale
+        for raw_cell in cells if isinstance(cells, list) else []:
+            if not isinstance(raw_cell, dict):
+                continue
+            local_x = int(raw_cell.get("x", 0))
+            local_y = int(raw_cell.get("y", 0))
+            tile_num = int(raw_cell.get("tile", 0)) & 0xFF
+            dest_x = tx + local_x
+            dest_y = ty + local_y
+            if not (0 <= dest_x < self.level.width_tiles and 0 <= dest_y < self.level.height_tiles):
+                continue
+            tile_img = render_tile_image(
+                self.level,
+                self.union_tiles,
+                self.palettes[self.current_level_index],
+                tile_num,
+                scale=scale,
+                transparent_zero=True,
+            ).convert("RGBA")
+            alpha = tile_img.getchannel("A").point(lambda value: min(value, 150))
+            tile_img.putalpha(alpha)
+            draw = ImageDraw.Draw(tile_img, "RGBA")
+            outline = (108, 203, 255, 245) if isinstance(raw_cell.get("secret"), dict) else (255, 211, 77, 235)
+            draw.rectangle((0, 0, tile_img.width - 1, tile_img.height - 1), outline=outline, width=max(1, scale))
+            photo = ImageTk.PhotoImage(tile_img)
+            self._tile_prefab_place_ghost_photos.append(photo)
+            self._tile_prefab_place_ghost_items.append(canvas.create_image(dest_x * tile_px, dest_y * tile_px, image=photo, anchor="nw", tags=("tile_prefab_place_ghost",)))
+        self._tile_prefab_place_ghost_key = key
+        self._ensure_tile_prefab_place_ghost_above_map()
+
     def _update_tile_place_ghost(self, event) -> None:
+        if self.tile_prefab_stamping is not None:
+            self._clear_tile_place_ghost()
+            self._update_tile_prefab_place_ghost(event)
+            return
+        self._clear_tile_prefab_place_ghost()
         if (
             event is None
             or self.level is None
             or self.editor_tool.get() != "Place"
             or self._active_level_editor_tab() != "Tiles"
+            or self.tile_prefab_stamping is not None
             or self.selected_tile_catalog_num is None
         ):
             self._clear_tile_place_ghost()
@@ -7404,11 +8051,18 @@ Raw offsets:
             f"{physics}; raw attrs [0]={attr0:02X} [1]={attr1:02X} [2]={attr2:02X} [3]={attr3:02X}"
         )
         self.selected_tile_catalog_num = tile_num
+        self.selected_tile_cells.clear()
+        self.selected_tile_prefab_cells.clear()
+        self.tile_prefab_stamping = None
+        self.tile_prefab_clipboard = self._tile_catalog_block()
         self._redraw_tile_catalog_selection()
+        self._rerender_tile_prefabs()
+        if hasattr(self, "tile_prefab_status"):
+            self.tile_prefab_status.set(f"Catalog tile 0x{tile_num:02X} ready. Click the prefab area to store it.")
         if self.editor_tool.get() == "Place":
             self.status_text.set(f"Tile 0x{tile_num:02X} selected as brush. Drag with left mouse on the level to paint; right mouse erases.")
         else:
-            self.status_text.set(f"Tile 0x{tile_num:02X} selected in the catalog. Switch to Place to use it as a paint brush.")
+            self.status_text.set(f"Tile 0x{tile_num:02X} selected in the catalog. Click the prefab area to store it, or switch to Place to paint.")
 
 
 def parse_args() -> argparse.Namespace:
