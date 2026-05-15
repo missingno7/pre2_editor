@@ -327,6 +327,12 @@ class Pre2EditorApp(tk.Tk):
         self.tables_detail_tile_photos: list[ImageTk.PhotoImage] = []
         self._detail_vars: list[tk.Variable] = []
         self._tile_property_vars: list[tk.Variable] = []
+        # Inspector sections are rebuilt frequently as staged fields change.
+        # Remember the user's open/closed choices so collapsible groups do not
+        # pop back open on every refresh. Raw/advanced sections default closed.
+        self._collapsible_section_states: dict[str, bool] = {}
+        # Keep PhotoImage references alive for inline tile ID picker previews.
+        self._tile_picker_inline_photos: list[ImageTk.PhotoImage] = []
         # Text typed into ttk.Entry/Spinbox widgets is not guaranteed to trigger
         # <FocusOut> before the Apply button command runs.  Keep the last editor
         # field and its commit callback so Apply can explicitly flush that text.
@@ -1152,10 +1158,13 @@ class Pre2EditorApp(tk.Tk):
             justify="left",
         ).pack(fill="x")
 
-        preview_frame = ttk.LabelFrame(parent, text="Tile behavior preview", padding=8)
-        preview_frame.pack(fill="x", pady=(0, 8))
-        self.physics_lab_canvas = tk.Canvas(preview_frame, width=240, height=240, bg="#202020", highlightthickness=0)
-        self.physics_lab_canvas.pack(fill="x", expand=False)
+        # The behavior diagram is useful, but it is secondary to the actual
+        # tile/secret editor.  Keep it in the same inspector-style disclosure
+        # section as the rest of the right panel, so users can fold it away when
+        # they are doing dense authoring work.
+        preview_frame = self._editor_section(parent, "Tile behavior preview")
+        self.physics_lab_canvas = tk.Canvas(preview_frame, width=180, height=180, bg="#202020", highlightthickness=0)
+        self.physics_lab_canvas.pack(fill="x", expand=False, padx=2, pady=(2, 4))
 
         self.tile_properties_form_container = ttk.LabelFrame(parent, text="Tile + secret properties", padding=6)
         self.tile_properties_form_container.pack(fill="both", expand=True)
@@ -1582,6 +1591,7 @@ class Pre2EditorApp(tk.Tk):
             return None
         yview = self.tile_properties_form.clear(preserve_scroll=preserve_scroll)
         self._tile_property_vars.clear()
+        self._tile_picker_inline_photos.clear()
         return yview
 
     def _ensure_tile_behavior_draft(self, tile_num: int, attr0: int, attr1: int, attr2: int, attr3: int) -> dict[str, object]:
@@ -2257,23 +2267,21 @@ class Pre2EditorApp(tk.Tk):
             editable=True,
             on_commit=self._stage_tile_secret_hits,
         )
-        self._add_editor_entry(
+        self._add_tile_id_picker(
             secrets,
             "Initial tile",
-            f"0x{int(secret_draft.get('initial_tile', tile_num)) & 0xFF:02X}",
+            int(secret_draft.get("initial_tile", tile_num)) & 0xFF,
             content_row + 1,
-            kind="tile",
+            field="initial_tile",
             editable=True,
-            on_commit=lambda raw: self._stage_tile_secret_tile_value("initial_tile", raw),
         )
-        self._add_editor_entry(
+        self._add_tile_id_picker(
             secrets,
             "Revealed tile",
-            f"0x{int(secret_draft.get('revealed_tile', tile_num)) & 0xFF:02X}",
+            int(secret_draft.get("revealed_tile", tile_num)) & 0xFF,
             content_row + 2,
-            kind="tile",
+            field="revealed_tile",
             editable=True,
-            on_commit=lambda raw: self._stage_tile_secret_tile_value("revealed_tile", raw),
         )
         if secret_mode == "none":
             self._editor_note(secrets, "Type=None means this block has no active secret. Pick a type and Apply to create one with sensible defaults.")
@@ -2341,10 +2349,10 @@ class Pre2EditorApp(tk.Tk):
             return
         c = self.physics_lab_canvas
         c.delete("all")
-        w = max(1, c.winfo_width() or 240)
-        h = max(1, c.winfo_height() or 240)
-        tile_size = min(w, h) - 60
-        tile_size = max(96, min(176, tile_size))
+        w = max(1, c.winfo_width() or 180)
+        h = max(1, c.winfo_height() or 180)
+        tile_size = min(w, h) - 44
+        tile_size = max(80, min(124, tile_size))
         x0 = (w - tile_size) / 2
         y0 = (h - tile_size) / 2
         x1 = x0 + tile_size
@@ -3373,11 +3381,72 @@ class Pre2EditorApp(tk.Tk):
         self._tile_property_vars.append(var)
         return var
 
-    def _editor_section(self, parent: tk.Misc, title: str) -> ttk.LabelFrame:
-        frame = ttk.LabelFrame(parent, text=title, padding=6)
-        frame.pack(fill="x", padx=2, pady=(0, 6))
-        frame.columnconfigure(1, weight=1)
-        return frame
+    def _editor_section(self, parent: tk.Misc, title: str) -> ttk.Frame:
+        """Create a compact collapsible inspector section.
+
+        Earlier versions rendered every section as a LabelFrame containing a
+        full-width ``ttk.Button``.  That technically worked, but it looked like
+        a form control rather than an inspector section and wasted vertical and
+        horizontal space.  The disclosure header is now the section chrome
+        itself: a slim clickable row with an arrow and bold title, similar to
+        photo/editing applications.  The returned body keeps the same grid
+        contract as before, so all existing field builders remain unchanged.
+        """
+        key = f"editor-section:{title}"
+        if key not in self._collapsible_section_states:
+            lowered = title.casefold()
+            # Dense diagnostic and secondary visualization sections should not
+            # crowd the primary authoring controls on first open.
+            self._collapsible_section_states[key] = not (
+                "raw" in lowered
+                or "advanced" in lowered
+                or "preview" in lowered
+            )
+        expanded = bool(self._collapsible_section_states[key])
+
+        shell = ttk.Frame(parent)
+        shell.pack(fill="x", padx=2, pady=(0, 6))
+        shell.columnconfigure(0, weight=1)
+
+        # A separator makes adjacent disclosures read as stacked inspector
+        # groups without the heavy nested-box look of LabelFrame.
+        ttk.Separator(shell, orient="horizontal").pack(fill="x", pady=(0, 1))
+        header = ttk.Frame(shell, padding=(4, 4, 4, 4), cursor="hand2")
+        header.pack(fill="x")
+        # Keep the header text directly on the labels instead of relying on
+        # short-lived local StringVars.  Tk can clear a textvariable when the
+        # Python Variable wrapper gets collected during frequent inspector
+        # rebuilds, which made the disclosure titles disappear.
+        arrow = ttk.Label(header, text="", width=2, cursor="hand2")
+        arrow.pack(side="left", anchor="w")
+        title_label = ttk.Label(header, text=title, cursor="hand2", font=("TkDefaultFont", 10, "bold"))
+        title_label.pack(side="left", fill="x", expand=True, anchor="w")
+
+        body = ttk.Frame(shell, padding=(6, 2, 6, 3))
+        body.columnconfigure(1, weight=1)
+
+        def sync_header() -> None:
+            arrow.configure(text="▾" if self._collapsible_section_states[key] else "▸")
+
+        def toggle(_event=None) -> None:
+            now = not bool(self._collapsible_section_states.get(key, True))
+            self._collapsible_section_states[key] = now
+            sync_header()
+            if now:
+                body.pack(fill="x", pady=(1, 0))
+            else:
+                body.pack_forget()
+            return "break"
+
+        for widget in (header, arrow, title_label):
+            widget.bind("<Button-1>", toggle)
+            widget.bind("<Return>", toggle)
+            widget.bind("<space>", toggle)
+
+        sync_header()
+        if expanded:
+            body.pack(fill="x", pady=(1, 0))
+        return body
 
     def _editor_note(self, parent: tk.Misc, text: str) -> None:
         """Add a prose note to either a packed container or a grid-based editor section.
@@ -3547,6 +3616,165 @@ class Pre2EditorApp(tk.Tk):
             combo.bind("<<ComboboxSelected>>", lambda _event, v=var, callback=on_select, original=initial: self._commit_editor_value(callback, v.get(), var=v, original=original))
         else:
             combo.bind("<<ComboboxSelected>>", lambda _event, v=var, original=initial: v.set(original))
+
+    def _add_tile_id_picker(
+        self,
+        parent: tk.Misc,
+        label: str,
+        value: int,
+        row: int,
+        *,
+        field: str,
+        editable: bool,
+    ) -> None:
+        """Tile-ID field with an inline thumbnail and a visual atlas picker."""
+        self._editor_field_row(parent, label, row)
+        holder = ttk.Frame(parent)
+        holder.grid(row=row, column=1, sticky="ew", pady=2)
+        holder.columnconfigure(1, weight=1)
+
+        tile_num = max(0, min(255, int(value)))
+        preview_label = ttk.Label(holder)
+        preview_label.grid(row=0, column=0, sticky="w", padx=(0, 6))
+        if self.level is not None and self.union_tiles:
+            try:
+                preview = render_tile_image(
+                    self.level,
+                    self.union_tiles,
+                    self.palettes[self.current_level_index],
+                    tile_num,
+                    scale=2,
+                )
+                photo = ImageTk.PhotoImage(preview)
+                self._tile_picker_inline_photos.append(photo)
+                preview_label.configure(image=photo)
+            except Exception:
+                preview_label.configure(text="▣")
+        else:
+            preview_label.configure(text="▣")
+
+        initial = f"0x{tile_num:02X}"
+        var = tk.StringVar(value=initial)
+        self._hold_tile_var(var)
+        entry = ttk.Entry(holder, textvariable=var, width=10, state="normal" if editable else "readonly")
+        entry.grid(row=0, column=1, sticky="ew")
+
+        def commit(_event=None, v=var, original=initial, target=field):
+            self._commit_editor_value(
+                lambda raw: self._stage_tile_secret_tile_value(target, raw),
+                v.get(),
+                var=v,
+                original=original,
+            )
+
+        if editable:
+            self._editor_widget_committers[entry] = commit
+            entry.bind("<FocusIn>", lambda _event, w=entry: self._remember_editor_edit_widget(w))
+            entry.bind("<KeyRelease>", lambda _event, w=entry: self._remember_editor_edit_widget(w), add="+")
+            entry.bind("<Return>", commit)
+        pick_button = ttk.Button(
+            holder,
+            text="Pick…",
+            state="normal" if editable else "disabled",
+            command=lambda target=field, title=label: self._open_tile_picker_dialog(title, target),
+        )
+        pick_button.grid(row=0, column=2, sticky="e", padx=(6, 0))
+        if editable:
+            preview_label.bind("<Button-1>", lambda _event, target=field, title=label: self._open_tile_picker_dialog(title, target))
+            preview_label.configure(cursor="hand2")
+
+    def _open_tile_picker_dialog(self, label: str, field: str) -> None:
+        if self.level is None or not self.union_tiles:
+            return
+        draft = self._ensure_tile_secret_draft(self.selected_tile_context) if self.selected_tile_context is not None else {}
+        selected = tk.IntVar(value=max(0, min(255, int(draft.get(field, 0)))))
+        dialog = tk.Toplevel(self)
+        dialog.title(f"Choose {label}")
+        dialog.transient(self)
+        dialog.geometry("610x610")
+        dialog.minsize(480, 420)
+        dialog.grab_set()
+
+        header = ttk.Frame(dialog, padding=10)
+        header.pack(fill="x")
+        status = tk.StringVar(value=f"Selected tile 0x{selected.get():02X}. Click a tile, then Choose; double-click chooses immediately.")
+        ttk.Label(header, textvariable=status, wraplength=560, justify="left").pack(fill="x")
+
+        browser = ScrollableCanvas(dialog, bg="#202020")
+        browser.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        atlas = render_tile_atlas(
+            self.level,
+            self.union_tiles,
+            self.palettes[self.current_level_index],
+            scale=2,
+            columns=16,
+        )
+        photo = ImageTk.PhotoImage(atlas)
+        browser.set_image(photo)
+        dialog._tile_picker_photo = photo  # type: ignore[attr-defined]
+
+        canvas = browser.canvas
+        tile_size = 32
+        selection_item: int | None = None
+
+        def draw_selection(tile_num: int) -> None:
+            nonlocal selection_item
+            if selection_item is not None:
+                canvas.delete(selection_item)
+            col = tile_num % 16
+            row = tile_num // 16
+            selection_item = canvas.create_rectangle(
+                col * tile_size + 1,
+                row * tile_size + 1,
+                (col + 1) * tile_size - 2,
+                (row + 1) * tile_size - 2,
+                outline="#FFD34D",
+                width=3,
+                tags=("tile_picker_selection",),
+            )
+            canvas.tag_raise(selection_item)
+            status.set(f"Selected tile 0x{tile_num:02X}. Click Choose or double-click the tile.")
+
+        def tile_from_event(event) -> int | None:
+            x = int(canvas.canvasx(event.x))
+            y = int(canvas.canvasy(event.y))
+            col = x // tile_size
+            row = y // tile_size
+            tile_num = row * 16 + col
+            return tile_num if 0 <= col < 16 and 0 <= row < 16 and 0 <= tile_num < 256 else None
+
+        def choose(tile_num: int | None = None) -> None:
+            chosen = selected.get() if tile_num is None else int(tile_num)
+            self._stage_tile_secret_tile_value(field, f"0x{chosen:02X}")
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            dialog.destroy()
+
+        def click(event) -> None:
+            tile_num = tile_from_event(event)
+            if tile_num is None:
+                return
+            selected.set(tile_num)
+            draw_selection(tile_num)
+
+        def double_click(event) -> None:
+            tile_num = tile_from_event(event)
+            if tile_num is None:
+                return
+            selected.set(tile_num)
+            draw_selection(tile_num)
+            choose(tile_num)
+
+        canvas.bind("<Button-1>", click)
+        canvas.bind("<Double-Button-1>", double_click)
+        draw_selection(selected.get())
+
+        buttons = ttk.Frame(dialog, padding=(10, 0, 10, 10))
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Choose tile", command=choose).pack(side="left", fill="x", expand=True)
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="left", fill="x", expand=True, padx=(8, 0))
 
     def _next_editor_grid_row(self, parent: tk.Misc) -> int:
         """Return the next free grid row in an editor section.
