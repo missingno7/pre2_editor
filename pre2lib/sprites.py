@@ -56,6 +56,24 @@ class SpriteResolver:
     def platform_sprite(self, level: LevelData, raw_num: int) -> int | None:
         return self.item_sprite(level, raw_num)
 
+    def item_raw_for_runtime(self, level: LevelData, runtime_num: int) -> int:
+        """Return a level-file item/platform sprite number for a runtime sprite.
+
+        Placement presets are stored in the stable runtime/global sprite
+        namespace, while LEVEL*.SQZ uses the level-local item bank base.  This
+        is the exact inverse of :meth:`item_sprite` for authored item/platform
+        visuals.
+        """
+        runtime_num = int(runtime_num) & 0x1FFF
+        if level.items_sprite_num_offset == 0xFFFF:
+            return runtime_num
+        if runtime_num >= self.item_runtime_base:
+            return (runtime_num - self.item_runtime_base + level.items_sprite_num_offset) & 0xFFFF
+        return runtime_num
+
+    def platform_raw_for_runtime(self, level: LevelData, runtime_num: int) -> int:
+        return self.item_raw_for_runtime(level, runtime_num)
+
     def monster_sprite(self, level: LevelData, raw_num: int) -> int | None:
         if raw_num == 0xFFFF:
             return None
@@ -66,6 +84,24 @@ class SpriteResolver:
         if raw_num >= level.items_sprite_num_offset:
             return (raw_num - level.items_sprite_num_offset + self.item_runtime_base) & 0x1FFF
         return raw_num & 0x1FFF
+
+    def monster_raw_for_runtime(self, level: LevelData, runtime_num: int) -> int:
+        """Return a level-file monster sprite number for a runtime/global sprite.
+
+        Enemy placement uses a global visual catalog, while LEVEL*.SQZ stores
+        sprite IDs relative to each level's monster bank.  Existing shipped
+        enemy visuals live in the monster runtime bank (312+), so reversing
+        that bank transform gives a stable per-level raw ID for newly placed
+        monsters.
+        """
+        runtime_num = int(runtime_num) & 0x1FFF
+        if level.items_sprite_num_offset == 0xFFFF:
+            return runtime_num
+        if runtime_num >= self.monster_runtime_base:
+            return (runtime_num - self.monster_runtime_base + level.monsters_sprite_num_offset) & 0xFFFF
+        if runtime_num >= self.item_runtime_base:
+            return (runtime_num - self.item_runtime_base + level.items_sprite_num_offset) & 0xFFFF
+        return runtime_num
 
 
 @lru_cache(maxsize=8)

@@ -1090,3 +1090,336 @@ def decode_planar_tile(tile: bytes | None) -> list[int]:
                         color |= 1 << plane
                 pixels.append(color)
     return pixels
+
+
+# ---------------------------------------------------------------------------
+# Editor save path
+# ---------------------------------------------------------------------------
+
+def _write_u16le(buf: bytearray, off: int, value: int) -> None:
+    if not 0 <= int(value) <= 0xFFFF:
+        raise Pre2FormatError(f"u16 value out of range at 0x{off:X}: {value}")
+    buf[off:off + 2] = int(value).to_bytes(2, "little", signed=False)
+
+
+def _write_s16le(buf: bytearray, off: int, value: int) -> None:
+    if not -0x8000 <= int(value) <= 0x7FFF:
+        raise Pre2FormatError(f"s16 value out of range at 0x{off:X}: {value}")
+    buf[off:off + 2] = int(value).to_bytes(2, "little", signed=True)
+
+
+def _write_s8(buf: bytearray, off: int, value: int) -> None:
+    if not -0x80 <= int(value) <= 0x7F:
+        raise Pre2FormatError(f"s8 value out of range at 0x{off:X}: {value}")
+    buf[off] = int(value) & 0xFF
+
+
+def _pack_bits_msb(codes: list[tuple[int, int]]) -> bytes:
+    out = bytearray()
+    bit_buffer = 0
+    bit_count = 0
+    for code, width in codes:
+        if not 0 <= code < (1 << width):
+            raise Pre2FormatError(f"SQZ code {code} does not fit {width} bits")
+        bit_buffer = (bit_buffer << width) | code
+        bit_count += width
+        while bit_count >= 8:
+            shift = bit_count - 8
+            out.append((bit_buffer >> shift) & 0xFF)
+            bit_buffer &= (1 << shift) - 1 if shift else 0
+            bit_count = shift
+    if bit_count:
+        out.append((bit_buffer << (8 - bit_count)) & 0xFF)
+    return bytes(out)
+
+
+def pack_sqz(raw: bytes) -> bytes:
+    """Write a conservative SQZ stream accepted by the original decoder.
+
+    The shipped assets use LZW-style dictionary compression. For editor saves
+    correctness is more important than compression ratio, so this writer emits
+    a standards-compliant SQZ stream that clears the dictionary before each
+    subsequent literal. The files are larger than the originals, but they
+    round-trip exactly through :func:`unpack_sqz` and avoid fragile edge cases in
+    variable-width LZW encoding while editing is still evolving.
+    """
+    size = len(raw)
+    if size > 0xFFFFF:
+        raise Pre2FormatError(f"SQZ payload too large: {size} bytes")
+    header = bytes(((size >> 16) & 0x0F, 0x10, size & 0xFF, (size >> 8) & 0xFF))
+    # ``unpack_sqz`` starts by resetting the dictionary and immediately reading
+    # the first data code. Unlike a conventional LZW container, the very first
+    # code is therefore the first literal (or END for an empty payload), not a
+    # leading CLEAR code.
+    codes: list[tuple[int, int]] = []
+    if not raw:
+        codes.append((257, 9))
+        return header + _pack_bits_msb(codes)
+    codes.append((raw[0], 9))
+    for byte in raw[1:]:
+        codes.append((256, 9))
+        codes.append((byte, 9))
+    codes.append((257, 9))
+    return header + _pack_bits_msb(codes)
+
+
+def _write_monster_extra(raw: bytearray, monster: Monster, *, base_offset: int | None = None) -> None:
+    """Patch authored movement-specific monster parameters kept in ``monster.extra``.
+
+    These offsets mirror :func:`_parse_monster_extra`. Runtime-init/filler fields
+    intentionally remain untouched unless they are already represented as normal
+    authored controls in the editor.
+    """
+    p = monster.raw_offset if base_offset is None else base_offset
+    t = monster.movement_type
+    extra = monster.extra
+
+    def u8(off: int, key: str) -> None:
+        if key in extra and extra[key] is not None:
+            raw[p + off] = int(extra[key]) & 0xFF
+
+    def s8(off: int, key: str) -> None:
+        if key in extra and extra[key] is not None:
+            _write_s8(raw, p + off, int(extra[key]))
+
+    def s16(off: int, key: str) -> None:
+        if key in extra and extra[key] is not None:
+            _write_s16le(raw, p + off, int(extra[key]))
+
+    if t == 2:
+        u8(0xD, "vertical_range_px")
+        s8(0xE, "vertical_speed_step")
+    elif t == 3:
+        u8(0xD, "activation_x_range_tiles")
+    elif t == 4:
+        u8(0xD, "swing_radius_px")
+        u8(0xE, "swing_angle_limit")
+    elif t == 5:
+        u8(0xD, "activation_x_range_tiles")
+        u8(0xE, "activation_y_range_tiles")
+        u8(0xF, "dash_speed_step")
+    elif t == 6:
+        u8(0xD, "activation_x_range_tiles")
+    elif t == 7:
+        u8(0xD, "activation_x_range_tiles")
+        u8(0xE, "launch_speed_step")
+    elif t == 8:
+        u8(0xD, "activation_x_range_tiles")
+        s8(0xE, "jump_up_speed_step")
+        s8(0xF, "jump_horizontal_speed_step")
+        u8(0x10, "activation_y_range_tiles")
+    elif t == 9:
+        s16(0xD, "patrol_left_x_px")
+        s16(0xF, "patrol_right_x_px")
+        u8(0x12, "patrol_max_speed_step")
+    elif t == 10:
+        u8(0xD, "emerge_attack_speed_step")
+    elif t == 11:
+        u8(0xD, "leap_horizontal_speed_step")
+        u8(0xE, "leap_up_speed_step")
+        u8(0xF, "max_fall_speed_step")
+    elif t == 12:
+        u8(0xD, "horizontal_speed_step")
+
+
+def monster_extra_defaults(movement_type: int) -> dict[str, Any]:
+    """Return editor-safe default behavior parameters for a monster behavior.
+
+    The game stores monster records with behavior-specific variable tails.  When
+    the editor converts a monster to a different behavior, those tails cannot be
+    re-used byte-for-byte.  A zeroed record of the target behavior gives us a
+    deterministic decoded baseline, after which shared named values may be kept
+    by the UI where that is meaningful.
+    """
+    length = EXPECTED_MONSTER_LENGTHS.get(movement_type)
+    if length is None:
+        raise Pre2FormatError(f"Cannot build defaults for unknown monster behavior {movement_type}")
+    raw = bytes([0] * length)
+    return _parse_monster_extra(raw, 0, movement_type, length)
+
+
+def _write_monster_record(raw: bytearray, offset: int, monster: Monster, *, original_record: bytes | None = None) -> int:
+    """Write one compact monster record at *offset* and return its end offset."""
+    movement_type = monster.movement_type
+    length = EXPECTED_MONSTER_LENGTHS.get(movement_type)
+    if length is None:
+        # Unknown behavior records can only be preserved at their existing size.
+        length = monster.length
+    if length < 13:
+        raise Pre2FormatError(f"Invalid monster record length {length} for behavior {movement_type}")
+    end = offset + length
+    if end > len(raw):
+        raise Pre2FormatError("Monster record write would exceed output buffer")
+    if original_record is not None and len(original_record) == length:
+        raw[offset:end] = original_record
+    else:
+        raw[offset:end] = b"\x00" * length
+    raw[offset] = length & 0xFF
+    raw[offset + 1] = monster.type_byte & 0xFF
+    _write_u16le(raw, offset + 2, monster.sprite_num_raw)
+    raw[offset + 4] = monster.flags & 0xFF
+    raw[offset + 5] = monster.energy & 0xFF
+    raw[offset + 6] = monster.respawn_ticks & 0xFF
+    raw[offset + 7] = monster.current_tick & 0xFF
+    raw[offset + 8] = monster.score & 0xFF
+    _write_u16le(raw, offset + 9, monster.x_pos)
+    _write_u16le(raw, offset + 11, monster.y_pos)
+    _write_monster_extra(raw, monster, base_offset=offset)
+    return end
+
+
+def rebuild_monster_attr_region(level: LevelData) -> bytes:
+    """Build the fixed-size compact monster attribute region from editor monsters."""
+    region = bytearray([0xFF]) * MONSTER_ATTR_REGION_SIZE
+    cursor = 0
+    if len(level.monsters) > MAX_LEVEL_MONSTERS:
+        raise Pre2FormatError(f"Monster table exceeds MAX_LEVEL_MONSTERS={MAX_LEVEL_MONSTERS}")
+    for monster in level.monsters:
+        movement_type = monster.movement_type
+        expected_length = EXPECTED_MONSTER_LENGTHS.get(movement_type, monster.length)
+        if cursor + expected_length > MONSTER_ATTR_REGION_SIZE:
+            raise Pre2FormatError(
+                f"Monster table no longer fits the 0x{MONSTER_ATTR_REGION_SIZE:X}-byte region "
+                f"after behavior conversion (needs at least 0x{cursor + expected_length:X})."
+            )
+        original_record = None
+        ro = monster.raw_offset
+        if level.monster_attr_region_offset <= ro < level.monster_attr_region_end:
+            original_length = level.raw[ro]
+            old_end = ro + original_length
+            if (
+                original_length == expected_length
+                and old_end <= level.monster_attr_region_end
+                and (level.raw[ro + 1] & 0x7F) == movement_type
+            ):
+                original_record = level.raw[ro:old_end]
+        cursor = _write_monster_record(region, cursor, monster, original_record=original_record)
+    return bytes(region)
+
+
+def serialize_level(level: LevelData) -> bytes:
+    """Serialize the mutable editor model back to the decompressed LEVEL*.SQZ payload.
+
+    The parser keeps the original decompressed bytes in ``level.raw``. The
+    serializer patches every table the current editor can mutate and leaves all
+    still-unknown regions byte-for-byte untouched.
+    """
+    raw = bytearray(level.raw)
+    if len(level.tilemap) != level.tilemap_size:
+        raise Pre2FormatError(
+            f"Tilemap size mismatch: got {len(level.tilemap)}, expected {level.tilemap_size}"
+        )
+    raw[:level.tilemap_size] = level.tilemap
+
+    p = level.metadata_offset
+    raw[p:p + 256] = level.tile_attributes0; p += 256
+    raw[p:p + 256] = level.tile_attributes1; p += 256
+    raw[p:p + 256] = level.tile_attributes2; p += 256
+
+    _write_u16le(raw, p, level.header.scrolling_top)
+    _write_u16le(raw, p + 2, level.header.start_x_pos)
+    _write_u16le(raw, p + 4, level.header.start_y_pos)
+    _write_u16le(raw, p + 6, level.header.tilemap_w)
+    raw[p + 8] = level.header.scrolling_mask & 0xFF
+    p += 9
+
+    for value in level.front_tiles_lut:
+        _write_u16le(raw, p, value)
+        p += 2
+
+    if len(level.gates) != MAX_LEVEL_GATES:
+        raise Pre2FormatError(f"Gate table must contain {MAX_LEVEL_GATES} records")
+    for gate in level.gates:
+        _write_u16le(raw, p, gate.enter_pos)
+        _write_u16le(raw, p + 2, gate.tilemap_pos)
+        _write_u16le(raw, p + 4, gate.dst_pos)
+        raw[p + 6] = gate.scroll_flag & 0xFF
+        p += 7
+
+    if len(level.columns) != MAX_LEVEL_COLUMNS:
+        raise Pre2FormatError(f"Column table must contain {MAX_LEVEL_COLUMNS} records")
+    for column in level.columns:
+        _write_u16le(raw, p, column.tilemap_pos)
+        raw[p + 2] = column.width & 0xFF
+        raw[p + 3] = column.height & 0xFF
+        _write_u16le(raw, p + 4, column.trigger_pos)
+        _write_u16le(raw, p + 6, column.tiles_offset_buf)
+        raw[p + 8] = column.y_target & 0xFF
+        raw[p + 9] = column.unk9 & 0xFF
+        p += 10
+
+    # Monster records are variable-length.  Rebuild the entire compact fixed-size
+    # attribute region on every save so Apply-driven behavior conversions can
+    # freely switch between target record sizes without leaving stale records.
+    if p != level.monster_attr_region_offset:
+        raise Pre2FormatError("Monster attribute region offset drifted during serialization")
+    monster_region = rebuild_monster_attr_region(level)
+    raw[level.monster_attr_region_offset:level.monster_attr_region_end] = monster_region
+
+    p = level.monster_attr_region_end
+    _write_u16le(raw, p, level.items_sprite_num_offset); p += 2
+    _write_u16le(raw, p, level.monsters_sprite_num_offset); p += 2
+
+    if len(level.bonuses) != MAX_LEVEL_BONUSES:
+        raise Pre2FormatError(f"Bonus table must contain {MAX_LEVEL_BONUSES} records")
+    for bonus in level.bonuses:
+        raw[p] = bonus.tile_num0 & 0xFF
+        raw[p + 1] = bonus.tile_num1 & 0xFF
+        raw[p + 2] = bonus.count & 0xFF
+        _write_u16le(raw, p + 3, bonus.pos)
+        p += 5
+
+    raw[p:p + 256] = level.tile_attributes3
+    p += 256
+
+    if len(level.items) != MAX_LEVEL_ITEMS:
+        raise Pre2FormatError(f"Item table must contain {MAX_LEVEL_ITEMS} records")
+    for item in level.items:
+        _write_s16le(raw, p, item.x_pos)
+        _write_s16le(raw, p + 2, item.y_pos)
+        _write_u16le(raw, p + 4, item.sprite_num_raw)
+        _write_s8(raw, p + 6, item.y_delta)
+        p += 7
+
+    if len(level.platforms) != MAX_LEVEL_PLATFORMS:
+        raise Pre2FormatError(f"Platform table must contain {MAX_LEVEL_PLATFORMS} records")
+    for platform in level.platforms:
+        _write_u16le(raw, p, platform.x_pos)
+        _write_u16le(raw, p + 2, platform.y_pos)
+        _write_u16le(raw, p + 4, platform.sprite_num_raw)
+        raw[p + 6] = platform.flags & 0xFF
+        p += 7
+        if platform.platform_type == 8:
+            _write_u16le(raw, p + 4, int(platform.extra.get("y_delta", 0)))
+            raw[p] = int(platform.extra.get("y_velocity", 0)) & 0xFF
+            raw[p + 1] = int(platform.extra.get("unk8", 0)) & 0xFF
+            raw[p + 2] = int(platform.extra.get("unk9", 0)) & 0xFF
+            raw[p + 3] = int(platform.extra.get("state", 0)) & 0xFF
+            raw[p + 6] = int(platform.extra.get("counter", 0)) & 0xFF
+            raw[p + 7] = int(platform.extra.get("padding", 0)) & 0xFF
+        else:
+            _write_s8(raw, p, int(platform.extra.get("max_velocity", 0)))
+            raw[p + 1] = int(platform.extra.get("padding", 0)) & 0xFF
+            raw[p + 2] = int(platform.extra.get("unk9", 0)) & 0xFF
+            _write_u16le(raw, p + 3, int(platform.extra.get("unkA", 0)))
+            _write_u16le(raw, p + 5, int(platform.extra.get("counter", 0)))
+            _write_s8(raw, p + 7, int(platform.extra.get("velocity", 0)))
+        p += 8
+
+    boss = level.boss
+    _write_u16le(raw, p, boss.x_min)
+    _write_u16le(raw, p + 2, boss.x_max)
+    raw[p + 4] = boss.speed & 0xFF
+    _write_s16le(raw, p + 5, boss.energy)
+    raw[p + 7] = boss.state & 0xFF
+    _write_u16le(raw, p + 8, boss.x_pos)
+    _write_u16le(raw, p + 10, boss.y_pos)
+    p += 12
+
+    if p != len(raw):
+        raise Pre2FormatError(f"Serialized metadata ended at 0x{p:X}, file ends at 0x{len(raw):X}")
+    return bytes(raw)
+
+
+def save_level_sqz(path: str | Path, level: LevelData) -> None:
+    Path(path).write_bytes(pack_sqz(serialize_level(level)))

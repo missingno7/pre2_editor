@@ -1,4 +1,4 @@
-"""Launcher for the Prehistorik 2 viewer/editor shell.
+"""Launcher for the Prehistorik 2 level editor.
 
 The UI lives in :mod:`ui.app`; this file stays as the user-facing entry point:
     python gui.py [game_data_folder]

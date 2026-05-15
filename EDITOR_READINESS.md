@@ -1,137 +1,48 @@
-# Editor readiness assessment
+# Editor readiness status
 
-## Bottom line
+## Current state
 
-The project is now past the point where it makes sense to keep expanding a separate “viewer-only” product. The UI should continue to evolve directly into the editor.
+The project has crossed from viewer shell to **working editor**.
 
-**The core level model is sufficiently understood to begin editor infrastructure**, provided the next engineering milestone is not a painting tool first, but:
+Implemented editor foundation:
 
-1. mutable `LevelDocument`,
-2. serializer / re-encoder,
-3. roundtrip tests,
-4. then small edit operations with undo/redo.
+- mutable in-memory level state,
+- decompressed payload serializer,
+- valid SQZ re-encoding for edited levels,
+- untouched serialize roundtrip checks across all shipped `LEVEL*.SQZ` files,
+- save/export UI with first-overwrite backup,
+- undo/redo,
+- delete for slot-based object tables,
+- non-destructive `View` tool and editing `Select` / `Place` tools.
 
-## What is already clear enough
+## Editing currently exposed
 
-### Level container and assets
+- tile painting,
+- item placement and dragging,
+- platform placement and dragging,
+- gate placement, endpoint picking, and dragging,
+- secret dragging,
+- shifting-column origin dragging,
+- boss dragging and deletion,
+- fixed-position monster dragging,
+- trigger-region monster dragging by region origin.
 
-- decompression works in Python,
-- level map and local/shared tile LUTs are parsed,
-- level height is inferred from file structure,
-- background/front/base render stack is understood,
-- sprite bank preview works,
-- object metadata tables parse consistently across shipped levels.
+## Current save guarantees
 
-### Tile behavior
+The serializer patches the editable level tables and preserves all still-unknown bytes from the original decompressed payload. Unchanged levels serialize back to the exact same decompressed bytes.
 
-- side/top/bottom collision semantics are decoded,
-- surface shape / slopes are decoded,
-- front-mask tiles are understood for rendering,
-- animated tiles are now decoded as 3-phase groups,
-- `attr2 0x10` is grounded as the fly-emitter flag in runtime logic,
-- `attr2 0x20` is tied to the player-step/decor tile-change logic.
+The SQZ writer currently favors compatibility over compression ratio. Edited `LEVEL*.SQZ` files may therefore be larger than the originals, while still decoding correctly with the project decoder and matching the level structure on reparse.
 
-The editor can expose these through Tile Props, while preserving raw attrs for exact save.
+## Deliberately not finished yet
 
-### Object categories
+- monster deletion / insertion into the variable-length monster record area,
+- broad field-level editing for every inspector property,
+- compact/dictionary-optimal SQZ recompression,
+- extracting all remaining bootstrap sidecars directly from `PRE2.EXE`.
 
-- gates,
-- shifting columns,
-- secrets,
-- items,
-- platforms,
-- monsters,
-- boss block.
+## Practical next steps
 
-All have parseable slot tables and can be selected/focused in the current UI.
-
-### Enemy/platform behavior
-
-- monster behavior record variants `T0–T12` are structurally parsed,
-- fixed spawn vs trigger region is understood,
-- behavior-specific parameters are named for editor use,
-- platform behavior low nibble has user-facing labels,
-- runtime-reset fields are separated conceptually from authored fields.
-
-## What still needs work before “real editing” is trustworthy
-
-### 1. Serializer and roundtrip tests — main blocker
-
-This is the real transition point.
-
-Needed tests:
-
-- parse -> serialize -> binary equality for untouched original files where possible,
-- parse -> serialize -> reparse structural equality,
-- table capacity and record-length validation,
-- preserving unedited raw bytes exactly where the editor has no semantic model yet.
-
-### 2. Explicit mutable document layer
-
-The current parser returns convenient read-only-ish structures. The editor should not mutate raw parser results ad hoc.
-
-Recommended split:
-
-- `LevelData` = faithful parsed source view,
-- `LevelDocument` = mutable editor state,
-- commands = add/move/delete/change operations,
-- serializer = `LevelDocument -> encoded level payload`.
-
-### 3. Remaining EXE-derived bootstrap sidecars
-
-Not a blocker for basic level editing, but still a “data purity” task:
-
-- palettes,
-- sprite geometry/origin tables,
-- background routing.
-
-These should eventually be extracted from unpacked `PRE2.EXE` instead of shipped in `resources/` sidecars.
-
-### 4. A few object semantics can still be refined
-
-Not editor blockers, but useful before polishing final UX:
-
-- more human names for enemies/items,
-- selected object behavior geometry overlays,
-- clearer grouping of multi-record secret structures,
-- precise wording for any attr2 behaviors whose naming is still a little editor-facing rather than original-game terminology.
-
-## Suggested next implementation order
-
-### Milestone A — editor foundation
-
-- introduce `LevelDocument`,
-- add serializer skeleton,
-- implement untouched roundtrip tests,
-- keep UI read-only while this stabilizes.
-
-### Milestone B — safe micro edits
-
-- move player start,
-- move an item,
-- move a monster fixed anchor,
-- change difficulty flag / easy binary field,
-- save and boot-test.
-
-These are ideal first mutations because they touch existing records without growing tables.
-
-### Milestone C — editor tools
-
-- Level Editor tab becomes active,
-- selection/move tool,
-- tile paint tool,
-- object list + placement/edit panels,
-- undo/redo.
-
-### Milestone D — complex authoring
-
-- new/delete records in capped slot tables,
-- gate editing with source/destination placement,
-- secret grouping UI,
-- tile behavior editing,
-- animated tile group authoring.
-
-## Decision
-
-**Yes: the fundamentals are clear enough to start the editor architecture now.**
-The next big risk is not missing RE on maps or core objects; it is making the first save path exact and robust.
+1. Boot-test edited SQZ levels in the original game/DOSBox.
+2. Promote the most useful inspector properties into real editable forms.
+3. Add variable-length monster table authoring once record growth/compaction is safely bounded.
+4. Replace conservative SQZ output with a compact encoder after game compatibility is proven.

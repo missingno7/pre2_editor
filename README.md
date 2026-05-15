@@ -1,128 +1,72 @@
-# Prehistorik 2 — viewer evolving into editor
+# Prehistorik 2 — level editor
 
-This project is now intentionally structured as a **read-only editor shell** for the DOS game **Prehistorik 2**. The current milestone is still viewer-first, but the UI and data model are being shaped so the next phase can unlock real editing rather than rebuild the application.
+This project is a working **Prehistorik 2 DOS level editor** built directly on the original game data. It still contains reverse-engineering notes and inspectors, but the main Level tab is now an editor rather than a viewer-only shell.
 
 ## Run
 
-Place the original game files into:
-
-```text
-game_data/
-```
-
-Then run:
-
 ```bash
-python gui.py
+python gui.py [game_data_folder]
 ```
 
-Or point to another folder explicitly:
+By default it uses `./game_data`.
 
-```bash
-python gui.py /path/to/prehistorik2/game_data
-```
+## Editor workflow
+
+### Tools
+
+- **View** — non-destructive browsing and panning only.
+- **Select** — select objects from the map and drag supported objects without the camera following them.
+- **Place** — paint tiles in the Tiles editor or place catalog-selected items/platforms/gates in the Objects editor.
+
+### Supported map editing
+
+- paint map tiles from the tile catalog,
+- place new items in free item slots,
+- place new platforms in free platform slots,
+- place gates and then pick source/destination tiles,
+- drag items, platforms, gates, secrets, shifting-column origins, bosses, and monsters,
+- drag trigger-region monsters by their trigger-region origin,
+- delete items, platforms, gates, shifting columns, secrets, and the boss controller,
+- inspect all parsed level tables and overlays.
+
+Monster deletion is intentionally not exposed yet because those records are packed variable-length inside a fixed monster attribute region. Fixed-position and trigger-region monster movement is supported.
+
+### Save / history
+
+The toolbar now includes:
+
+- **Save level** — overwrites the current `LEVEL*.SQZ`, creating `LEVEL*.SQZ.bak` on the first overwrite,
+- **Export level…** — writes an edited copy elsewhere,
+- **Undo / Redo** — command history for in-editor edits,
+- **Delete selected** — removes the currently selected supported object.
+
+Keyboard shortcuts:
+
+- `Ctrl+S` save,
+- `Ctrl+Z` undo,
+- `Ctrl+Y` redo,
+- `Delete` delete selected object.
+
+When switching levels, changing data folder, or reloading, the editor asks whether unsaved edits should be saved first.
+
+## Save format note
+
+The editor now contains a real serializer for the mutable level model and round-trips unchanged decompressed level payloads exactly. Edited levels are re-encoded as valid SQZ streams. The current SQZ writer is intentionally conservative: it prioritizes correctness and decoder compatibility over compression ratio, so an edited `LEVEL*.SQZ` can be larger than the original compressed file.
 
 ## Project layout
 
 ```text
 gui.py                         user-facing launcher
-ui/app.py                      Tk editor/viewer shell
-pre2lib/formats.py             raw game file decompression + level parsing
-pre2lib/renderer.py            tile/background/level bitmap rendering
-pre2lib/sprites.py             sprite bank decoding and sprite rendering
-pre2lib/labels.py              editor-facing human labels for items/enemies
-resources/                      temporary RE bootstrap sidecars
-reverse_engineering/           notes, helper scripts, reference excerpts, executable notes
-game_data/                     expected location of the user's original game files
+ui/app.py                      Tk editor UI
+pre2lib/formats.py             parsers, serializer, SQZ writer
+pre2lib/renderer.py            level/tile rendering
+pre2lib/sprites.py             sprite decoding/rendering helpers
+pre2lib/labels.py              user-facing object labels
+resources/                     palette/sprite bootstrap sidecars
+reverse_engineering/           notes, snippets, helper scripts
+game_data/                     original game files used by the editor
 ```
 
-The active Python implementation now lives under `pre2lib/`; old root-level compatibility wrappers have been removed.
+## Current RE/editor boundary
 
-## Current capabilities
-
-### Original game data loading
-
-- Reads original `LEVEL*.SQZ`, `UNION.SQZ`, `FRONT.SQZ`, `SPRITES.SQZ`, and `BACK*.SQZ` directly.
-- Implements the EAT and SQZ decompressors in Python.
-- Infers level height from the level file structure itself rather than from a hidden Python constant.
-- Parses the full level metadata payload:
-  - tile attribute tables 0–3,
-  - scrolling/start header,
-  - front tile LUT,
-  - gates,
-  - shifting columns,
-  - variable-length monster records,
-  - sprite-number base offsets,
-  - secrets,
-  - items,
-  - platforms,
-  - boss block.
-
-### Level viewer / editor shell
-
-- Main **Level Viewer** with drag panning, default 3× zoom, and initial camera focus on player start.
-- Background image layer using the original `BACK*.SQZ` assets.
-- Front-mask layer rendering using `FRONT.SQZ`.
-- Independent vector/canvas overlays rather than baked bitmap debug colors.
-- Real object sprite previews for items, platforms, and fixed-position enemies.
-- Trigger-region monsters shown as actual trigger rectangles rather than fake spawn points.
-- Mechanics redesigned as read-only future editor panels:
-  - human-facing object names,
-  - compact object picker -> focus map,
-  - click map overlay -> open the matching inspector,
-  - gate source/destination focus cycling,
-  - form-like inspectors with disabled future-editable controls.
-- **Tile Props** inspector for tiles clicked in the Level Viewer, shaped as the future tile behavior editor.
-
-### Tile behavior visualization
-
-- User-facing collision/surface diagram:
-  - green = solid/supporting collision,
-  - cyan = slippery top surface,
-  - yellow = drop-through top surface,
-  - red = deadly contact.
-- Sides, top, bottom and slope geometry are drawn on the physically relevant tile edge.
-- Tile Props presents `attr0/1/2/3` as editor-like controls instead of raw byte dumps first.
-
-### Animated tiles — now modeled explicitly
-
-The viewer now understands the real **3-tile animated tile group** structure:
-
-- `attr2 & 0x80` marks only the **base** tile of a group,
-- the two following tile IDs are also animation phases,
-- all three phases are treated as animated members,
-- toolbar can switch the level preview between **Frame 1 / Frame 2 / Frame 3**,
-- Tile Props shows animation group base, group members, selected phase and per-tile visual sequence.
-
-See:
-
-```text
-reverse_engineering/notes/ANIMATED_TILES.md
-```
-
-## Temporary RE bootstrap data still isolated
-
-Two things are still represented as sidecars under `resources/` rather than extracted directly from an unpacked `PRE2.EXE`:
-
-- `palettes.json`
-- `sprite_tables_reference.json`
-
-The project keeps them isolated so they can be replaced cleanly by direct EXE extraction later.
-
-## Reverse-engineering support material
-
-`reverse_engineering/` now includes:
-
-- animated-tile technical notes,
-- a Python animated-tile reporting script,
-- source excerpts from the user-provided `blues` reference engine used for the animation interpretation,
-- executable/disassembly bookkeeping notes. `PRE2.EXE` is still LZEXE-packed; a packed-binary objdump excerpt is included only as a reference artifact, not as a semantic source.
-
-## Next phase
-
-See:
-
-- `VIEWER_WRAPUP.md`
-- `EDITOR_READINESS.md`
-
-The next large technical task should be **mutable document + serializer + roundtrip tests**, with remaining viewer improvements kept directly relevant to editing.
+The editor is already useful for tile/object layout work and can save those edits. Some deeper property panels still function primarily as inspectors while the underlying semantics are refined. The save path preserves untouched unknown bytes and serializes the tables currently edited by the UI.

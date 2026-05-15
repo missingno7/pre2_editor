@@ -218,14 +218,67 @@ PLATFORM_VISUAL_NAMES: dict[int, str] = {
 }
 
 
-def monster_visual_name(sprite_num: int | None) -> str:
+# Global placement catalog for enemies.  These are runtime/global sprite IDs,
+# not per-level raw record numbers.  The editor converts them back to the
+# currently open level's raw monster sprite namespace when building a draft.
+# The default behavior is only an initial draft choice; the placement inspector
+# lets the user pick any known behavior before placing.
+MONSTER_PLACEMENT_DEFAULT_BEHAVIOR: dict[int, int] = {
+    313: 9,
+    314: 9,
+    317: 1,
+    318: 2,
+    319: 2,
+    330: 5,
+    331: 5,
+    335: 9,
+    336: 9,
+    341: 8,
+    342: 8,
+    345: 8,
+    349: 8,
+    352: 0,
+    355: 9,
+    356: 9,
+    359: 11,
+    366: 3,
+    370: 10,
+    381: 10,
+    382: 9,
+    383: 9,
+    386: 10,
+    396: 8,
+    397: 8,
+    402: 7,
+    440: 12,
+    441: 9,
+    453: 6,
+    454: 6,
+}
+
+MONSTER_PLACEMENT_VISUALS: tuple[int, ...] = tuple(sorted(MONSTER_VISUAL_NAMES))
+
+MONSTER_BEHAVIOR_VISUAL_OVERRIDES: dict[tuple[int, int], str] = {
+    # Trigger-region spawners do not visually correspond to their base frame
+    # labels in the raw sprite annotation table. These two are confirmed from
+    # Level 1 gameplay/editor inspection.
+    (381, 10): "Small cave beast spawner",
+    (386, 10): "Large turtle spawner",
+}
+
+
+def monster_visual_name(sprite_num: int | None, movement_type: int | None = None) -> str:
     if sprite_num is None:
         return "Unknown enemy"
+    if movement_type is not None:
+        override = MONSTER_BEHAVIOR_VISUAL_OVERRIDES.get((sprite_num, movement_type))
+        if override is not None:
+            return override
     return MONSTER_VISUAL_NAMES.get(sprite_num, f"Unlabeled enemy visual {sprite_num}")
 
 
-def monster_display_name(sprite_num: int | None, behavior_name: str) -> str:
-    visual = monster_visual_name(sprite_num)
+def monster_display_name(sprite_num: int | None, behavior_name: str, movement_type: int | None = None) -> str:
+    visual = monster_visual_name(sprite_num, movement_type)
     return f"{visual} — {behavior_name}"
 
 

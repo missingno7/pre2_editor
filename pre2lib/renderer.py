@@ -319,3 +319,85 @@ def render_level_image(
     if scale != 1:
         img = img.resize((img.width * scale, img.height * scale), Image.Resampling.NEAREST)
     return img
+
+
+def render_level_chunk_image(
+    level: LevelData,
+    union_tiles: bytes,
+    palette: list[int],
+    *,
+    chunk_tile_x: int,
+    chunk_tile_y: int,
+    chunk_width_tiles: int,
+    chunk_height_tiles: int,
+    front_tiles: bytes | None = None,
+    scale: int = 1,
+    show_front_layer: bool = False,
+    animation_frame: int = 0,
+    show_secret_reveals: bool = True,
+) -> Image.Image:
+    """Render one rectangular map chunk using world tile coordinates.
+
+    The editor uses this for incremental repainting: tile strokes invalidate the
+    chunk that owns the touched cell instead of rebuilding the entire level
+    raster. The output is intentionally limited to the persistent level bitmap
+    (base tiles, secret ghost tiles, optional front layer); canvas overlays are
+    still drawn separately by the UI.
+    """
+    rgb = vga6_to_rgb(palette)
+    tile_cache: dict[int, list[int]] = {}
+    front_cache: dict[int, list[int]] = {}
+    width_tiles = max(0, min(chunk_width_tiles, level.width_tiles - chunk_tile_x))
+    height_tiles = max(0, min(chunk_height_tiles, level.height_tiles - chunk_tile_y))
+    img = Image.new("RGBA", (max(1, width_tiles * 16), max(1, height_tiles * 16)), (0, 0, 0, 0))
+
+    for local_ty in range(height_tiles):
+        ty = chunk_tile_y + local_ty
+        row_off = ty * level.width_tiles
+        for local_tx in range(width_tiles):
+            tx = chunk_tile_x + local_tx
+            source_tile_num = level.tilemap[row_off + tx]
+            tile_num = level.tile_for_animation_frame(source_tile_num, animation_frame)
+            pixels = tile_cache.get(tile_num)
+            if pixels is None:
+                pixels = decode_planar_tile(resolve_tile_bytes(level, union_tiles, tile_num))
+                tile_cache[tile_num] = pixels
+            _draw_indexed_tile(img, local_tx * 16, local_ty * 16, pixels, rgb, transparent_zero=True)
+
+    if show_secret_reveals:
+        for bonus in level.active_bonuses:
+            if bonus.initial_tile == bonus.revealed_tile:
+                continue
+            tx, ty = level.tilemap_xy(bonus.pos)
+            if not (chunk_tile_x <= tx < chunk_tile_x + width_tiles and chunk_tile_y <= ty < chunk_tile_y + height_tiles):
+                continue
+            ghost = Image.new("RGBA", (16, 16), (0, 0, 0, 0))
+            for tile_num in (bonus.initial_tile, bonus.revealed_tile):
+                pixels = tile_cache.get(tile_num)
+                if pixels is None:
+                    pixels = decode_planar_tile(resolve_tile_bytes(level, union_tiles, tile_num))
+                    tile_cache[tile_num] = pixels
+                _draw_indexed_tile_alpha(ghost, 0, 0, pixels, rgb, 128)
+            local_x = (tx - chunk_tile_x) * 16
+            local_y = (ty - chunk_tile_y) * 16
+            ImageDraw.Draw(img).rectangle((local_x, local_y, local_x + 15, local_y + 15), fill=(0, 0, 0, 0))
+            img.alpha_composite(ghost, (local_x, local_y))
+
+    if show_front_layer and front_tiles is not None:
+        for local_ty in range(height_tiles):
+            ty = chunk_tile_y + local_ty
+            row_off = ty * level.width_tiles
+            for local_tx in range(width_tiles):
+                tx = chunk_tile_x + local_tx
+                tile_num = level.tilemap[row_off + tx]
+                if not (level.tile_attributes2[tile_num] & 0x40):
+                    continue
+                pixels = front_cache.get(tile_num)
+                if pixels is None:
+                    pixels = decode_planar_tile(resolve_front_tile_bytes(level, front_tiles, tile_num))
+                    front_cache[tile_num] = pixels
+                _draw_indexed_tile(img, local_tx * 16, local_ty * 16, pixels, rgb, transparent_zero=True)
+
+    if scale != 1:
+        img = img.resize((img.width * scale, img.height * scale), Image.Resampling.NEAREST)
+    return img
