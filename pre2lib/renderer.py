@@ -289,7 +289,7 @@ def render_level_image(
             for index, platform in enumerate(level.active_platforms):
                 marker(platform.x_pos, platform.y_pos, f"P{index}:{platform.platform_type}", (255, 140, 70, 190), radius=5)
 
-        if "monsters" in show_object_overlays:
+        if "monsters" in show_object_overlays or "monster_areas" in show_object_overlays:
             for index, monster in enumerate(level.monsters):
                 if monster.uses_trigger_rect:
                     rect = monster.trigger_rect_tiles
@@ -298,10 +298,14 @@ def render_level_image(
                         x0, y0 = tx * 16, ty * 16
                         x1 = (tx + tw + 1) * 16 - 1
                         y1 = (ty + th + 1) * 16 - 1
-                        draw.rectangle((x0, y0, x1, y1), fill=(255, 60, 60, 38), outline=(255, 60, 60, 220), width=2)
-                        label_draw.text((x0 + 2, y0 + 2), f"M{index}:T{monster.movement_type}", fill=(255, 255, 255))
+                        if "monster_areas" in show_object_overlays:
+                            draw.rectangle((x0, y0, x1, y1), fill=(255, 60, 60, 38), outline=(255, 60, 60, 220), width=2)
+                            label_draw.text((x0 + 2, y0 + 2), f"M{index}:T{monster.movement_type}", fill=(255, 255, 255))
+                        if "monsters" in show_object_overlays:
+                            marker((x0 + x1) // 2, (y0 + y1) // 2, f"M{index}:T{monster.movement_type}", (255, 60, 60, 190), radius=5)
                 else:
-                    marker(monster.x_pos, monster.y_pos, f"M{index}:T{monster.movement_type}", (255, 60, 60, 190), radius=5)
+                    if "monsters" in show_object_overlays:
+                        marker(monster.x_pos, monster.y_pos, f"M{index}:T{monster.movement_type}", (255, 60, 60, 190), radius=5)
 
         if "boss" in show_object_overlays and level.boss.active:
             boss = level.boss

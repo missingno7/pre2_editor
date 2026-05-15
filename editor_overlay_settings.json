@@ -12,7 +12,8 @@
   "overlay_front_tiles": false,
   "overlay_gates": true,
   "overlay_items": true,
-  "overlay_monsters": false,
+  "overlay_monster_areas": false,
+  "overlay_monsters": true,
   "overlay_physics_diagram": true,
   "overlay_platforms": true,
   "overlay_player_start": true

@@ -366,9 +366,15 @@ class Pre2EditorApp(tk.Tk):
         self._tile_place_ghost_photo: ImageTk.PhotoImage | None = None
         self._tile_place_ghost_item: int | None = None
         self._tile_place_ghost_key: tuple[int, int, int, int] | None = None
+        # Ghost images are visually constant while only the cursor position changes.
+        # Cache the rendered tile/object preview and move existing canvas items instead
+        # of rebuilding PIL/ImageTk content on every mouse motion.
+        self._tile_place_ghost_visual_key: tuple[int, int] | None = None
         self._object_place_ghost_photo: ImageTk.PhotoImage | None = None
         self._object_place_ghost_items: list[int] = []
         self._object_place_ghost_key: tuple[object, ...] | None = None
+        self._object_place_ghost_visual_key: tuple[object, ...] | None = None
+        self._last_tile_info_key: tuple[object, ...] | None = None
         self._tile_catalog_selection_outline: int | None = None
 
         self.difficulty = tk.StringVar(value="Expert")
@@ -389,6 +395,7 @@ class Pre2EditorApp(tk.Tk):
         # have different coordinate domains, handled explicitly in the renderer.
         self.overlay_player_start = tk.BooleanVar(value=self._overlay_setting_bool("overlay_player_start", True))
         self.overlay_monsters = tk.BooleanVar(value=self._overlay_setting_bool("overlay_monsters", False))
+        self.overlay_monster_areas = tk.BooleanVar(value=self._overlay_setting_bool("overlay_monster_areas", False))
         self.overlay_items = tk.BooleanVar(value=self._overlay_setting_bool("overlay_items", False))
         self.overlay_platforms = tk.BooleanVar(value=self._overlay_setting_bool("overlay_platforms", False))
         self.overlay_gates = tk.BooleanVar(value=self._overlay_setting_bool("overlay_gates", False))
@@ -486,6 +493,7 @@ class Pre2EditorApp(tk.Tk):
             "overlay_physics_diagram": self.overlay_physics_diagram,
             "overlay_player_start": self.overlay_player_start,
             "overlay_monsters": self.overlay_monsters,
+            "overlay_monster_areas": self.overlay_monster_areas,
             "overlay_items": self.overlay_items,
             "overlay_platforms": self.overlay_platforms,
             "overlay_gates": self.overlay_gates,
@@ -700,6 +708,7 @@ class Pre2EditorApp(tk.Tk):
         object_rows = [
             ("Player start", self.overlay_player_start),
             ("Enemies / monsters", self.overlay_monsters),
+            ("Monster trigger areas", self.overlay_monster_areas),
             ("Items", self.overlay_items),
             ("Platforms", self.overlay_platforms),
             ("Gates", self.overlay_gates),
@@ -766,7 +775,7 @@ class Pre2EditorApp(tk.Tk):
         ).pack(fill="x", pady=(0, 4))
         ttk.Checkbutton(
             select_frame,
-            text="Show inactive slots",
+            text="Show all records",
             variable=self.show_inactive_object_slots,
             command=self._refresh_tables,
         ).pack(anchor="w", fill="x", pady=(0, 8))
@@ -880,7 +889,7 @@ class Pre2EditorApp(tk.Tk):
         if tool == "Place" and self._active_level_editor_tab() == "Objects" and hasattr(self, "object_tool_tabs"):
             self.object_tool_tabs.select(1)
             self._refresh_placement_draft_detail()
-        elif tool in {"View", "Select"} and self._active_level_editor_tab() == "Objects" and hasattr(self, "object_tool_tabs"):
+        elif tool == "Select" and self._active_level_editor_tab() == "Objects" and hasattr(self, "object_tool_tabs"):
             self.object_tool_tabs.select(0)
             if self.selected_parsed_object is not None:
                 self._refresh_parsed_detail(*self.selected_parsed_object)
@@ -2257,43 +2266,46 @@ class Pre2EditorApp(tk.Tk):
         if secret_draft.get("slot") is not None:
             self._add_editor_entry(secrets, "Backing slot", f"S{int(secret_draft['slot'])}", 1, kind="tile")
             content_row = 2
-        else:
+        elif secret_mode != "none":
             self._add_editor_entry(secrets, "Backing slot", "Allocated on Apply if Type is not None", 1, kind="tile")
             content_row = 2
-        max_hits = self._tile_secret_max_hits(secret_mode)
-        self._add_editor_spinbox(
-            secrets,
-            "Hit count",
-            min(max(1, int(secret_draft.get("hit_count", 1))), max_hits),
-            content_row,
-            kind="tile",
-            from_=1,
-            to=max_hits,
-            editable=True,
-            on_commit=self._stage_tile_secret_hits,
-        )
-        self._add_tile_id_picker(
-            secrets,
-            "Initial tile",
-            int(secret_draft.get("initial_tile", tile_num)) & 0xFF,
-            content_row + 1,
-            field="initial_tile",
-            editable=True,
-        )
-        self._add_tile_id_picker(
-            secrets,
-            "Revealed tile",
-            int(secret_draft.get("revealed_tile", tile_num)) & 0xFF,
-            content_row + 2,
-            field="revealed_tile",
-            editable=True,
-        )
+        else:
+            content_row = 1
         if secret_mode == "none":
             self._editor_note(secrets, "Type=None means this block has no active secret. Pick a type and Apply to create one with sensible defaults.")
-        elif secret_mode == "tile_reveal":
-            self._editor_note(secrets, "Reveal secrets default to initial tile 0x7E and reveal this tile, but both tile IDs are editable here.")
         else:
-            self._editor_note(secrets, "Bonus secrets default to the block's current tile for both initial and revealed visuals; edit them here when needed.")
+            max_hits = self._tile_secret_max_hits(secret_mode)
+            self._add_editor_spinbox(
+                secrets,
+                "Hit count",
+                min(max(1, int(secret_draft.get("hit_count", 1))), max_hits),
+                content_row,
+                kind="tile",
+                from_=1,
+                to=max_hits,
+                editable=True,
+                on_commit=self._stage_tile_secret_hits,
+            )
+            self._add_tile_id_picker(
+                secrets,
+                "Initial tile",
+                int(secret_draft.get("initial_tile", tile_num)) & 0xFF,
+                content_row + 1,
+                field="initial_tile",
+                editable=True,
+            )
+            self._add_tile_id_picker(
+                secrets,
+                "Revealed tile",
+                int(secret_draft.get("revealed_tile", tile_num)) & 0xFF,
+                content_row + 2,
+                field="revealed_tile",
+                editable=True,
+            )
+            if secret_mode == "tile_reveal":
+                self._editor_note(secrets, "Reveal secrets default to initial tile 0x7E and reveal this tile, but both tile IDs are editable here.")
+            else:
+                self._editor_note(secrets, "Bonus secrets default to the block's current tile for both initial and revealed visuals; edit them here when needed.")
         extra_slots = tuple(secret_draft.get("extra_slots", ()))
         if extra_slots:
             self._editor_note(secrets, "Multiple active secret slots target this same tile. This inline editor changes the first slot; the remaining slots stay untouched: " + ", ".join(f"S{idx}" for idx in extra_slots))
@@ -2509,6 +2521,8 @@ class Pre2EditorApp(tk.Tk):
             flags.add("player_start")
         if not visible_overlays_only or self.overlay_monsters.get():
             flags.add("monsters")
+        if not visible_overlays_only or self.overlay_monster_areas.get():
+            flags.add("monster_areas")
         if not visible_overlays_only or self.overlay_items.get():
             flags.add("items")
         if not visible_overlays_only or self.overlay_platforms.get():
@@ -3114,7 +3128,7 @@ class Pre2EditorApp(tk.Tk):
                 draw_sprite(spr, platform.x_pos, platform.y_pos)
                 marker_world(platform.x_pos, platform.y_pos, f"P{index}", color="#FF8C46")
 
-        if "monsters" in obj_flags:
+        if "monsters" in obj_flags or "monster_areas" in obj_flags:
             expert = self.difficulty.get() == "Expert"
             for index, monster in enumerate(self.level.monsters):
                 if not expert and monster.expert_only:
@@ -3128,10 +3142,15 @@ class Pre2EditorApp(tk.Tk):
                     x0, y0 = tx * 16, ty * 16
                     x1 = (tx + tw + 1) * 16
                     y1 = (ty + th + 1) * 16
-                    rect_world(x0, y0, x1, y1, outline="#FF3C3C", fill="#FF3C3C", width=2, stipple="gray25")
-                    text_world(x0 + 2, y0 + 2, f"M{index}: trigger T{monster.movement_type}")
-                    draw_sprite(spr, (x0 + x1) // 2, (y0 + y1) // 2, centered=True)
+                    if "monster_areas" in obj_flags:
+                        rect_world(x0, y0, x1, y1, outline="#FF3C3C", fill="#FF3C3C", width=2, stipple="gray25")
+                        text_world(x0 + 2, y0 + 2, f"M{index}: trigger T{monster.movement_type}")
+                    if "monsters" in obj_flags:
+                        draw_sprite(spr, (x0 + x1) // 2, (y0 + y1) // 2, centered=True)
+                        marker_world((x0 + x1) // 2, (y0 + y1) // 2, f"M{index}:T{monster.movement_type}", color="#FF3C3C")
                 else:
+                    if "monsters" not in obj_flags:
+                        continue
                     draw_sprite(spr, monster.x_pos, monster.y_pos)
                     marker_world(monster.x_pos, monster.y_pos, f"M{index}:T{monster.movement_type}", color="#FF3C3C")
 
@@ -5828,16 +5847,18 @@ class Pre2EditorApp(tk.Tk):
             cols = ["Enemy", "Behavior", "Difficulty", "Location"]
             self._configure_table_tree(cols)
             expert = self.difficulty.get() == "Expert"
+            show_all = self.show_inactive_object_slots.get()
             for idx, monster in enumerate(self.level.monsters):
-                if not expert and monster.expert_only:
+                if not expert and monster.expert_only and not show_all:
                     continue
                 sprite_view = self.sprite_resolver.monster_sprite(self.level, monster.sprite_num_raw)
                 enemy_name = monster_visual_name(sprite_view, monster.movement_type)
+                difficulty_suffix = " [Expert]" if monster.expert_only else ""
                 self._insert_parsed_row(
                     f"monster:{idx}",
                     "monster",
                     idx,
-                    f"M{idx}: {enemy_name}",
+                    f"M{idx}: {enemy_name}{difficulty_suffix}",
                 )
 
         elif selected == "Items":
@@ -6750,6 +6771,15 @@ Raw offsets:
             return None
         return world_x - origin_x, world_y - height, world_x - origin_x + width, world_y
 
+    def _centered_sprite_world_bbox(self, sprite_num: int | None, world_x: float, world_y: float) -> tuple[float, float, float, float] | None:
+        if sprite_num is None or not 0 <= sprite_num < self.sprite_tables.count:
+            return None
+        try:
+            width, height = self.sprite_tables.size(sprite_num)
+        except Exception:
+            return None
+        return world_x - width / 2, world_y - height / 2, world_x + width / 2, world_y + height / 2
+
     @staticmethod
     def _point_in_rect(point_x: float, point_y: float, rect: tuple[float, float, float, float], pad: float = 0.0) -> bool:
         x0, y0, x1, y1 = rect
@@ -6790,9 +6820,9 @@ Raw offsets:
     def _object_hit_from_event(self, event, *, visible_overlays_only: bool = True) -> tuple[str, int, str | None] | None:
         """Return a parsed object under the click.
 
-        Select-mode clicks and View-mode double-clicks respect the visible overlay
-        switches.  Hidden editor layers therefore do not unexpectedly steal a hit
-        from the tile or object layer the user is currently looking at.
+        Select-mode clicks and View-mode double-clicks respect the visible
+        object overlay switches. Hidden editor layers should not unexpectedly
+        steal hits from the layer the user is currently working with.
         """
         if self.level is None:
             return None
@@ -6810,20 +6840,35 @@ Raw offsets:
                 if bbox is not None and self._point_in_rect(wx, wy, bbox, pad=3.0):
                     return "item", idx, None
 
-        if not visible_overlays_only or self.overlay_monsters.get():
+        if not visible_overlays_only or self.overlay_monsters.get() or self.overlay_monster_areas.get():
             expert = self.difficulty.get() == "Expert"
             for idx, monster in enumerate(self.level.monsters):
                 if not expert and monster.expert_only:
                     continue
                 if monster.uses_trigger_rect and monster.trigger_rect_tiles is not None:
                     tx, ty, tw, th = monster.trigger_rect_tiles
-                    bbox = (tx * 16, ty * 16, (tx + tw + 1) * 16, (ty + th + 1) * 16)
-                    if self._point_in_rect(wx, wy, bbox):
+                    area_bbox = (tx * 16, ty * 16, (tx + tw + 1) * 16, (ty + th + 1) * 16)
+                    if (not visible_overlays_only or self.overlay_monster_areas.get()) and self._point_in_rect(wx, wy, area_bbox):
                         return "monster", idx, None
+                    if not visible_overlays_only or self.overlay_monsters.get():
+                        spr = self.sprite_resolver.monster_sprite(self.level, monster.sprite_num_raw)
+                        center_x = (area_bbox[0] + area_bbox[2]) / 2
+                        center_y = (area_bbox[1] + area_bbox[3]) / 2
+                        bbox = self._centered_sprite_world_bbox(spr, center_x, center_y)
+                        if bbox is not None and self._point_in_rect(wx, wy, bbox, pad=4.0):
+                            return "monster", idx, None
+                        marker_bbox = (center_x - 6, center_y - 6, center_x + 6, center_y + 6)
+                        if self._point_in_rect(wx, wy, marker_bbox):
+                            return "monster", idx, None
                 else:
+                    if visible_overlays_only and not self.overlay_monsters.get():
+                        continue
                     spr = self.sprite_resolver.monster_sprite(self.level, monster.sprite_num_raw)
                     bbox = self._sprite_world_bbox(spr, monster.x_pos, monster.y_pos)
                     if bbox is not None and self._point_in_rect(wx, wy, bbox, pad=4.0):
+                        return "monster", idx, None
+                    marker_bbox = (monster.x_pos - 6, monster.y_pos - 6, monster.x_pos + 6, monster.y_pos + 6)
+                    if self._point_in_rect(wx, wy, marker_bbox):
                         return "monster", idx, None
 
         if not visible_overlays_only or self.overlay_platforms.get():
@@ -7000,6 +7045,7 @@ Raw offsets:
         self._tile_place_ghost_item = None
         self._tile_place_ghost_photo = None
         self._tile_place_ghost_key = None
+        self._tile_place_ghost_visual_key = None
 
     def _ensure_tile_place_ghost_above_map(self) -> None:
         if self._tile_place_ghost_item is None:
@@ -7028,20 +7074,27 @@ Raw offsets:
         key = (tx, ty, tile_num, scale)
         if self._tile_place_ghost_key == key and self._tile_place_ghost_item is not None:
             return
-        tile_img = render_tile_image(
-            self.level,
-            self.union_tiles,
-            self.palettes[self.current_level_index],
-            tile_num,
-            scale=scale,
-            transparent_zero=True,
-        ).convert("RGBA")
-        alpha = tile_img.getchannel("A")
-        alpha = alpha.point(lambda value: min(value, 150))
-        tile_img.putalpha(alpha)
-        draw = ImageDraw.Draw(tile_img, "RGBA")
-        draw.rectangle((0, 0, tile_img.width - 1, tile_img.height - 1), outline=(255, 211, 77, 235), width=max(1, scale))
-        photo = ImageTk.PhotoImage(tile_img)
+
+        visual_key = (tile_num, scale)
+        photo = self._tile_place_ghost_photo
+        if photo is None or self._tile_place_ghost_visual_key != visual_key:
+            tile_img = render_tile_image(
+                self.level,
+                self.union_tiles,
+                self.palettes[self.current_level_index],
+                tile_num,
+                scale=scale,
+                transparent_zero=True,
+            ).convert("RGBA")
+            alpha = tile_img.getchannel("A")
+            alpha = alpha.point(lambda value: min(value, 150))
+            tile_img.putalpha(alpha)
+            draw = ImageDraw.Draw(tile_img, "RGBA")
+            draw.rectangle((0, 0, tile_img.width - 1, tile_img.height - 1), outline=(255, 211, 77, 235), width=max(1, scale))
+            photo = ImageTk.PhotoImage(tile_img)
+            self._tile_place_ghost_photo = photo
+            self._tile_place_ghost_visual_key = visual_key
+
         x = tx * 16 * scale
         y = ty * 16 * scale
         if self._tile_place_ghost_item is None:
@@ -7049,9 +7102,10 @@ Raw offsets:
                 x, y, image=photo, anchor="nw", tags=("tile_place_ghost",)
             )
         else:
-            self.level_canvas.canvas.itemconfigure(self._tile_place_ghost_item, image=photo)
+            # Moving the existing image is substantially cheaper than regenerating
+            # the tile bitmap while the mouse crosses each map cell.
             self.level_canvas.canvas.coords(self._tile_place_ghost_item, x, y)
-        self._tile_place_ghost_photo = photo
+            self.level_canvas.canvas.itemconfigure(self._tile_place_ghost_item, image=photo)
         self._tile_place_ghost_key = key
         self._ensure_tile_place_ghost_above_map()
 
@@ -7061,6 +7115,7 @@ Raw offsets:
         self._object_place_ghost_items.clear()
         self._object_place_ghost_photo = None
         self._object_place_ghost_key = None
+        self._object_place_ghost_visual_key = None
 
     def _ensure_object_place_ghost_above_map(self) -> None:
         for item in self._object_place_ghost_items:
@@ -7192,6 +7247,39 @@ Raw offsets:
         key = (kind, sprite_num, x_int, y_int, scale)
         if self._object_place_ghost_key == key and self._object_place_ghost_items:
             return
+
+        try:
+            origin_x, _origin_y = self.sprite_tables.origin(sprite_num)
+            _width, height = self.sprite_tables.size(sprite_num)
+        except Exception:
+            self._clear_object_place_ghost()
+            return
+
+        visual_key = ("sprite", kind, sprite_num, scale)
+        image_x = (x_int - origin_x) * scale
+        image_y = (y_int - height) * scale
+        anchor_radius = max(3, 3 * scale)
+        ax = x_int * scale
+        ay = y_int * scale
+
+        # For sprite ghosts, the expensive PIL/ImageTk render depends on the
+        # selected visual and zoom, not on the current cursor position. Reuse
+        # the bitmap and canvas items, updating only their coordinates while the
+        # user sweeps the mouse around the level.
+        can_reuse_items = (
+            self._object_place_ghost_visual_key == visual_key
+            and len(self._object_place_ghost_items) == 3
+            and canvas.type(self._object_place_ghost_items[0]) == "image"
+        )
+        if can_reuse_items:
+            image_item, horizontal, vertical = self._object_place_ghost_items
+            canvas.coords(image_item, image_x, image_y)
+            canvas.coords(horizontal, ax - anchor_radius, ay, ax + anchor_radius, ay)
+            canvas.coords(vertical, ax, ay - anchor_radius, ax, ay + anchor_radius)
+            self._object_place_ghost_key = key
+            self._ensure_object_place_ghost_above_map()
+            return
+
         try:
             sprite = render_sprite_image(
                 self.sprites_blob,
@@ -7200,15 +7288,11 @@ Raw offsets:
                 sprite_num,
                 scale=scale,
             )
-            origin_x, _origin_y = self.sprite_tables.origin(sprite_num)
-            _width, height = self.sprite_tables.size(sprite_num)
         except Exception:
             self._clear_object_place_ghost()
             return
         ghost = self._ghosten_rgba(sprite)
         photo = ImageTk.PhotoImage(ghost)
-        image_x = (x_int - origin_x) * scale
-        image_y = (y_int - height) * scale
         self._clear_object_place_ghost()
         image_item = canvas.create_image(
             image_x,
@@ -7217,9 +7301,6 @@ Raw offsets:
             anchor="nw",
             tags=("object_place_ghost",),
         )
-        anchor_radius = max(3, 3 * scale)
-        ax = x_int * scale
-        ay = y_int * scale
         horizontal = canvas.create_line(
             ax - anchor_radius,
             ay,
@@ -7241,6 +7322,7 @@ Raw offsets:
         self._object_place_ghost_photo = photo
         self._object_place_ghost_items.extend([image_item, horizontal, vertical])
         self._object_place_ghost_key = key
+        self._object_place_ghost_visual_key = visual_key
         self._ensure_object_place_ghost_above_map()
 
     def _on_level_motion(self, event) -> None:
@@ -7248,12 +7330,17 @@ Raw offsets:
         self._update_object_place_ghost(event)
         coords = self._level_coords_from_event(event)
         if coords is None or self.level is None:
-            self.tile_info_text.set("Tile: —")
+            if self._last_tile_info_key != ("none",):
+                self.tile_info_text.set("Tile: —")
+                self._last_tile_info_key = ("none",)
             return
         tx, ty = coords
         tile_num = self.level.tile_num_at(tx, ty)
         lut = self.level.lut_value(tile_num or 0)
-        self.tile_info_text.set(f"Map ({tx}, {ty}) → tile 0x{tile_num:02X}, LUT 0x{lut:04X}")
+        info_key = (tx, ty, tile_num, lut)
+        if self._last_tile_info_key != info_key:
+            self.tile_info_text.set(f"Map ({tx}, {ty}) → tile 0x{tile_num:02X}, LUT 0x{lut:04X}")
+            self._last_tile_info_key = info_key
 
     def _tile_browser_num(self, event) -> int | None:
         x = int(self.tile_canvas.canvas.canvasx(event.x))
