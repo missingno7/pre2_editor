@@ -53,6 +53,7 @@ from pre2lib.labels import (
     platform_behavior_name,
     platform_display_name,
 )
+from pre2lib.passwords import all_level_passwords
 
 
 class ScrollableCanvas(ttk.Frame):
@@ -1368,14 +1369,23 @@ class Pre2EditorApp(tk.Tk):
 
         summary_tab = ttk.Frame(self.file_preview_notebook, padding=8)
         visual_tab = ttk.Frame(self.file_preview_notebook)
+        passwords_tab = ttk.Frame(self.file_preview_notebook, padding=8)
         self.file_preview_notebook.add(summary_tab, text="File Info")
         self.file_preview_notebook.add(visual_tab, text="Visual Preview")
+        self.file_preview_notebook.add(passwords_tab, text="Passwords")
 
         self.file_preview_text = tk.Text(summary_tab, wrap="word", state="disabled")
         self.file_preview_text.pack(fill="both", expand=True)
 
         self.file_preview_canvas = ScrollableCanvas(visual_tab, bg="#202020")
         self.file_preview_canvas.pack(fill="both", expand=True)
+
+        self.passwords_text = tk.Text(passwords_tab, wrap="none", state="disabled", font=("Consolas", 10))
+        self.passwords_text.pack(side="left", fill="both", expand=True)
+        passwords_yscroll = ttk.Scrollbar(passwords_tab, orient="vertical", command=self.passwords_text.yview)
+        passwords_yscroll.pack(side="right", fill="y")
+        self.passwords_text.configure(yscrollcommand=passwords_yscroll.set)
+        self._refresh_passwords_tab()
 
     def _choose_folder(self) -> None:
         if not self._confirm_discard_or_save_changes():
@@ -3483,6 +3493,7 @@ class Pre2EditorApp(tk.Tk):
         self.game_file_records.clear()
         if not self.data_path.exists():
             self.files_tree.insert("", "end", values=(str(self.data_path), "", "", "Folder not found"))
+            self._refresh_passwords_tab()
             return
 
         files = sorted((p for p in self.data_path.iterdir() if p.is_file()), key=lambda p: p.name.lower())
@@ -3526,6 +3537,61 @@ class Pre2EditorApp(tk.Tk):
                     "parser": f"read failed: {exc}",
                 }
                 self.files_tree.insert("", "end", iid=iid, values=(path.name, "", "", f"read failed: {exc}"))
+        self._refresh_passwords_tab()
+
+    def _set_passwords_text(self, text: str) -> None:
+        if not hasattr(self, "passwords_text"):
+            return
+        self.passwords_text.configure(state="normal")
+        self.passwords_text.delete("1.0", "end")
+        self.passwords_text.insert("1.0", text)
+        self.passwords_text.configure(state="disabled")
+
+    def _level_password_glyph_counts(self) -> dict[int, int]:
+        counts: dict[int, int] = {}
+        for index in range(len(LEVEL_IDS)):
+            try:
+                level = load_level(self.data_path, index)
+            except Exception:
+                continue
+            counts[index] = sum(1 for item in level.items if 0 <= item.sprite_num_raw - 283 <= 15)
+        return counts
+
+    def _refresh_passwords_tab(self) -> None:
+        if not hasattr(self, "passwords_text"):
+            return
+        glyph_counts = self._level_password_glyph_counts()
+        lines = [
+            "Level passwords",
+            "",
+            "The game does not store final passwords as text in LEVEL*.SQZ.",
+            "On level load it finds item sprites 283..298 (0-9/A-F), sorts them by X position,",
+            "then writes the 4 nibbles from random_get_number3(level_index + difficulty_offset).",
+            "Beginner uses offset 0; Expert uses offset 10. Level index is the game's internal 0-based level number.",
+            "",
+            "Level  Beginner  Expert  Glyphs in LEVEL*.SQZ",
+            "-----  --------  ------  -------------------",
+        ]
+        for row in all_level_passwords():
+            glyph_count = glyph_counts.get(row.level_index)
+            if glyph_count is None:
+                glyph_note = "level file missing/unreadable"
+            elif glyph_count == 0:
+                glyph_note = "none"
+            elif glyph_count % 4 == 0:
+                groups = glyph_count // 4
+                glyph_note = f"{glyph_count} ({groups} group{'s' if groups != 1 else ''})"
+            else:
+                glyph_note = f"{glyph_count} (not a multiple of 4)"
+            lines.append(f"{row.level_id:<5}  {row.beginner:<8}  {row.expert:<6}  {glyph_note}")
+        lines.extend(
+            [
+                "",
+                "Source: reverse-engineered blues/p2 level loader:",
+                "random_get_number3(seed) = rol16(((seed ^ 0x55A3) * 0xB297) & 0xFFFF, 3).",
+            ]
+        )
+        self._set_passwords_text("\n".join(lines))
 
     def _set_file_preview_text(self, text: str) -> None:
         self.file_preview_text.configure(state="normal")
