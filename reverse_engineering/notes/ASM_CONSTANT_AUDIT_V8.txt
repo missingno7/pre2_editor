@@ -1,0 +1,8 @@
+PRE2_load.bin size=63216 bytes
+OK   PRNG seed              0x079D1  # Matches p2/resource.c random seed state.
+MISS player_anim_lut        --  # Expected from p2/staticres.c; no direct flat match so far.
+MISS jump y_tbl int8        --  # Expected signed bytes -65,-51,-35,-20,-10,-5,-2,-1,0.
+MISS jump y_tbl int16       --  # Same values as little-endian int16 words.
+MISS object_anim idle       --  # object_anim_7d93 from p2/staticres.c.
+MISS object_anim run head   --  # Run animation prefix from p2/staticres.c.
+MISS club anim head         --  # club_anim_data prefix from p2/staticres.c.

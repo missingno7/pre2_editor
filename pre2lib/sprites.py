@@ -7,6 +7,7 @@ import json
 from PIL import Image
 
 from .formats import unpack_file, vga6_to_rgb, LevelData
+from .assets import find_data_file
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,7 +118,7 @@ def load_sprite_tables(project_dir: str | Path) -> SpriteTables:
 
 @lru_cache(maxsize=8)
 def load_sprites_blob(data_path: str | Path) -> bytes:
-    return unpack_file(Path(data_path) / "sprites.sqz")
+    return unpack_file(find_data_file(data_path, "SPRITES.SQZ"))
 
 
 def sprite_data_offsets(tables: SpriteTables) -> tuple[int, ...]:

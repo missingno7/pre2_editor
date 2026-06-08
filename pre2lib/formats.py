@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 import json
 
+from .assets import find_data_file
+
 LEVEL_IDS = "123456789ABCDEFG"
 
 # Reverse-engineered from the original level loader control flow; this mapping
@@ -949,7 +951,7 @@ def load_level(data_path: str | Path, level_index: int) -> LevelData:
         raise ValueError(f"level_index must be 0..{len(LEVEL_IDS) - 1}")
 
     level_id = LEVEL_IDS[level_index]
-    level_file = Path(data_path) / f"level{level_id.lower()}.sqz"
+    level_file = find_data_file(data_path, f"LEVEL{level_id}.SQZ")
     raw = unpack_file(level_file)
     _height, level = _discover_level_height(raw, level_index, level_id)
     return level
@@ -1013,18 +1015,18 @@ def describe_tile_physics(attr0: int, attr1: int, attr3: int) -> str:
     )
 
 def load_union_tiles(data_path: str | Path) -> bytes:
-    return unpack_file(Path(data_path) / "union.sqz")
+    return unpack_file(find_data_file(data_path, "UNION.SQZ"))
 
 
 def load_front_tiles(data_path: str | Path) -> bytes:
-    return unpack_file(Path(data_path) / "front.sqz")
+    return unpack_file(find_data_file(data_path, "FRONT.SQZ"))
 
 
 def load_background_bitmap(data_path: str | Path, level_index: int) -> bytes:
     if level_index < 0 or level_index >= len(BACKGROUND_FILE_BY_LEVEL):
         raise ValueError(f"level_index must be 0..{len(BACKGROUND_FILE_BY_LEVEL) - 1}")
     background_index = BACKGROUND_FILE_BY_LEVEL[level_index]
-    blob = unpack_file(Path(data_path) / f"back{background_index}.sqz")
+    blob = unpack_file(find_data_file(data_path, f"BACK{background_index}.SQZ"))
     if len(blob) != 32000:
         raise Pre2FormatError(
             f"BACK{background_index}.SQZ decoded to {len(blob)} bytes; expected planar 320×200×4bpp (32000 bytes)"

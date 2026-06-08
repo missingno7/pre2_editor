@@ -70,3 +70,24 @@ game_data/                     original game files used by the editor
 ## Current RE/editor boundary
 
 The editor is already useful for tile/object layout work and can save those edits. Some deeper property panels still function primarily as inspectors while the underlying semantics are refined. The save path preserves untouched unknown bytes and serializes the tables currently edited by the UI.
+
+## Gameplay reverse-engineering runtime
+
+A second launcher now exists next to the editor:
+
+```bash
+python run_game.py [game_data_folder]
+```
+
+Controls:
+
+- arrows or `A/D` move,
+- `Space` jumps,
+- `[` / `]` switch levels,
+- `R` reloads current level,
+- `F1` toggles the runtime debug line,
+- `Esc` exits.
+
+`run_game.py` is intentionally separate from `gui.py`.  The editor stays an asset/level authoring tool, while `runtime/game.py` contains mutable gameplay state and the reverse-engineered tick loop.  The current runtime bootstrap already uses original `LEVEL*.SQZ`, `UNION.SQZ`, `FRONT.SQZ`, `BACK*.SQZ`, `SPRITES.SQZ`, palettes, sprite tables, tile collision attributes, integer physics, and a 19 Hz DOS-style simulation tick.  Enemy/platform/item logic is still mostly visual/static scaffolding and is the next place to replace approximations with disassembly-backed behavior.
+
+On case-sensitive filesystems, the loaders now resolve DOS uppercase data files case-insensitively, so the same code works with the original `LEVEL1.SQZ` style names.

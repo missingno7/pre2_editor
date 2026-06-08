@@ -832,3 +832,21 @@ The current Python model now stores animated groups explicitly and renders Frame
 ## Tile Props UX correction
 
 The Tile Props inspector is intentionally tied to **tiles selected in the level map**. The Tiles browser remains an atlas/browser and does not steal the Tile Props inspector when clicked.
+
+## v8 gameplay/engine pass
+
+- Treat `blues-master/p2` as a high-level map only; added an ASM audit tool for constants.
+- Added mutable runtime tilemap state and `decor_tile0_offset` handling from `level_update_tile0()`.
+- Player collision probe height now uses `spr_size_tbl[]` from `p2/staticres.c`, not decoded sprite bitmap size.
+- Ported the upward attr2 ceiling/nudge branch from `level_update_tile0()` more faithfully.
+- Added `runtime/demo.py` and `trace_player.py --demo-keyb` for original `KEYB.SQZ` demo input playback.
+- Notes: `reverse_engineering/notes/GAMEPLAY_ENGINE_PASS_V8.md`, `ASM_CONSTANT_AUDIT_V8.txt`.
+
+## v9 gameplay pass
+
+- Added `objects_tbl[0..10]` runtime subset for club overlay, club projectiles and hit sparks.
+- Ported the high-level shape of `level_update_player_anim_3_6_7()`, `anim_4`, `anim_5`, and `level_update_objects_club_projectiles()` from `blues_p2/level.c` into `run_game`.
+- Added `runtime/original_tables.py` helpers for `club_anim_data` / `club_anim_tbl`.
+- Added `reverse_engineering/tools/decode_club_anim.py`.
+- Extended `trace_player.py --objects` for repeatable action/club traces.
+- Status: club tables are still blues-confirmed, not ASM-confirmed; `asm_constant_audit.py` still does not find them as flat byte sequences in `PRE2_load.bin`.
