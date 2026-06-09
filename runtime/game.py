@@ -45,7 +45,13 @@ from runtime.original_tables import (
     PLAYER_RUN_ACCEL16,
     PLAYER_RUN_MAX16,
     sprite_logic_size,
+    COS_TBL,
+    SIN_TBL,
 )
+
+
+def _s8(v: int) -> int:
+    return v - 256 if v >= 128 else v
 
 DOS_W = 320
 DOS_H = 200
@@ -59,13 +65,12 @@ TRANS_OPEN_FRAMES = 12
 # Active play area height (blues TILEMAP_SCREEN_H = GAME_SCREEN_H - PANEL_H).
 # The bottom PANEL_H lines are the HUD, not part of the playfield/camera.
 PLAY_H = DOS_H - PANEL_H  # 176
-# Logic ticks/sec. The original PRE2 has no fixed logic rate: it is vsync-capped
-# (mode 13h ~70 Hz) and CPU-bound, so the felt speed is reference-dependent.
-# 30 felt too fast; the earlier 19 felt unresponsive mostly because of a club
-# cooldown bug (now fixed), not the rate. 20 is the working speed target; tune
-# this single constant against DOSBox side-by-side.
-TICK_HZ = 20
-TICK_MS = round(1000 / TICK_HZ)
+# Logic ticks/sec. The original PRE2 is vsync/work-limited (mode 13h ~70 Hz), so
+# the effective logic rate is ~21.8 ticks/sec measured from the real DOS game
+# (not a clean retrace divider, which is why it isn't an integer). The engine
+# steps at exactly this rate; render interpolation smooths it to the display FPS
+# even though the numbers don't divide evenly.
+TICK_HZ = 21.8
 TILE = 16
 
 # Runtime constants are deliberately centralized. Values with *16 suffix are
@@ -239,6 +244,8 @@ class RuntimeObject:
     y: int = 0
     ipx: int = 0  # interpolation snapshot (position before the last tick)
     ipy: int = 0
+    iact: bool = False  # was this slot active at the snapshot
+    iref: int = -2      # slot identity at the snapshot (ref_index) -> detect slot reuse
     x_velocity: int = 0
     y_velocity: int = 0
     x_friction: int = 0
@@ -286,6 +293,8 @@ class RuntimeMonsterState:
     x_step: int = 0
     type6_pattern_index: int = 0
     type0_side: int = 0
+    type4_angle: int = 0
+    type4_angle_step: int = 0
 
 
 @dataclass(slots=True)
@@ -536,6 +545,13 @@ class RuntimeWorld:
             if words[p] < 0:
                 break
         obj.anim_ptr = p
+
+    def _monster_rotate_pos(self, obj: RuntimeObject, ms: RuntimeMonsterState, radius: int) -> None:
+        """blues monster_rotate_pos(): place the type-4 spider on a circle of
+        `radius` around its anchor at the current angle (signed cos/sin >> 2)."""
+        a = ms.type4_angle & 0xFF
+        obj.x = ms.x_pos + ((radius * (_s8(COS_TBL[a]) >> 2)) >> 4)
+        obj.y = ms.y_pos + ((radius * (_s8(SIN_TBL[a]) >> 2)) >> 4)
 
     def _monster_update_anim(self, obj: RuntimeObject) -> None:
         """blues level_monster_update_anim(): switch to the death sequence.
@@ -1435,6 +1451,17 @@ class RuntimeWorld:
         if obj.slot >= 23:
             self._clear_item_ref(obj)
 
+    def _activate_exit_semaphore(self) -> None:
+        """blues lighter pickup: the level-exit semaphore item (runtime sprite
+        278, num 225) becomes the active exit (279, num 226) so the player can
+        touch it to complete the level."""
+        for item in self.level.items:
+            if item.sprite_num_raw == 0xFFFF:
+                continue
+            rt = self.sprite_resolver.item_sprite(self.level, item.sprite_num_raw)
+            if rt is not None and (rt & 0x1FFF) == 278:
+                item.sprite_num_raw += 1
+
     def _trigger_checkpoint(self, obj: RuntimeObject) -> None:
         """blues checkpoint branch: set respawn and change the checkpoint sprite
         to its triggered state (runtime 281 -> 280), reverting any previously
@@ -1498,12 +1525,14 @@ class RuntimeWorld:
             self._add_score_object(obj, 227); self._consume_item(obj); return
         if num in (167, 168, 458, 459):  # damage
             self.play_sound(1)
+            self.player.shake_screen_counter = 7  # blues
             if self.player.hit_counter == 0:
                 self.player.hit_counter = 44
                 self.player.anim_0x40_flag = 0
             self._consume_item(obj); return
         if num == 169:  # screen kill
             self.play_sound(0)
+            self.player.shake_screen_counter = 9  # blues
             self._kill_all_monsters(bomb=False); self._consume_item(obj); return
         if num == 170:  # bomb
             self.play_sound(0)
@@ -1530,9 +1559,27 @@ class RuntimeWorld:
             self._consume_item(obj); return
         if num <= 50:  # utensils
             self.play_sound(8)
+            if num == 46:  # lighter: activates the exit semaphore (item 278 -> 279)
+                self._activate_exit_semaphore()
             self._consume_item(obj); return
-        if num <= 166:  # food / fruit / score collectibles
-            self.play_sound(4 if num <= 64 else 8)
+        if num <= 64:  # food
+            self.play_sound(4)
+            # blues: food still falling fast (>=128) is kicked up off the player's
+            # head instead of being collected (and shakes 50% of the time).
+            if obj.data_y_velocity >= 128:
+                obj.data_y_velocity = -obj.data_y_velocity
+                x = 32
+                if self.prng.next_u8() & 1:
+                    x = -x
+                    self.player.shake_screen_counter = 7
+                obj.x_velocity = x
+                return  # not collected
+            idx = num - 57
+            score_num = SCORE_SPR_LUT[idx] + 74 if 0 <= idx < len(SCORE_SPR_LUT) else 74
+            self._add_score_object(obj, score_num)
+            self._consume_item(obj); return
+        if num <= 166:  # fruit / score collectibles
+            self.play_sound(8)
             idx = num - 57
             score_num = SCORE_SPR_LUT[idx] + 74 if 0 <= idx < len(SCORE_SPR_LUT) else 74
             self._add_score_object(obj, score_num)
@@ -1693,6 +1740,8 @@ class RuntimeWorld:
                 tile = self.tile_num_at_tile(pos_tx, pos_ty)
                 attr1 = self.level.tile_attributes1[tile] if tile is not None else 1
                 if attr1 != 0:
+                    # (No shake here: the ASM does not shake when a food bonus
+                    # lands/bounces — only on hard player falls, big hits, etc.)
                     obj.data_y_velocity = -obj.data_y_velocity >> 1
                     was_left = obj.x_velocity < 0
                     delta = -8 if was_left else 8
@@ -1808,7 +1857,8 @@ class RuntimeWorld:
         self.player.death_vy = yv
         self._update_runtime_monsters()
         self._update_runtime_bonuses()
-        self._update_camera()
+        # The camera does NOT follow the dying player (it stays where the player
+        # died and the body flies out of frame).
         self.player.death_timer -= 1
         if self.player.death_timer <= 0:
             self._respawn_player()
@@ -1834,6 +1884,12 @@ class RuntimeWorld:
         self.player.prev_y = self.player.y
         self.player.death_flag = 0
         self.player.restart_level_flag = 0
+        # Snap the camera onto the respawn point so the off-screen death check
+        # doesn't immediately re-trigger.
+        self.camera_x = max(0, self.player.x - DOS_W // 2)
+        self.camera_y = max(0, self.player.y - PLAY_H // 2)
+        self._clamp_camera()
+        self._icam_x, self._icam_y = self.camera_x, self.camera_y
 
     def tick(self, inp: InputState) -> None:
         self.tick_count += 1
@@ -1948,9 +2004,21 @@ class RuntimeWorld:
         self._update_runtime_items()
         self._update_gates(inp)
 
-        # Falling off the bottom of the level, or any death flag, starts the
-        # death animation (blues level_player_die -> level_player_death_animation).
-        if self.player.y > self.world_h + 128 or self.player.death_flag:
+        # blues level_update_player_decor: the player dies (level_player_die) when
+        # they go off-screen -- more than TILEMAP_SCREEN_H/16 (11) tiles from the
+        # camera top vertically, more than TILEMAP_SCREEN_W/16 (20) tiles
+        # horizontally, or below the map bottom. This kills a fall into a pit once
+        # the camera can no longer follow.
+        cam_ty = self.camera_y >> 4
+        cam_tx = self.camera_x >> 4
+        py_diff = abs((self.player.y >> 4) - cam_ty)
+        px_diff = abs((self.player.x >> 4) - cam_tx)
+        off_screen = (
+            py_diff > (PLAY_H // 16)
+            or px_diff > (DOS_W // 16)
+            or (self.player.y >= 0 and self.player.y > ((self.level.height_tiles + 1) << 4))
+        )
+        if off_screen or self.player.death_flag:
             self._start_death()
 
         if self.player.shake_screen_counter > 0:
@@ -2124,6 +2192,9 @@ class RuntimeWorld:
                 flags = 0x37
             elif typ in (4, 5, 6, 7, 8):
                 flags = 5
+                if typ == 4:  # blues monster_func2_type4: reset swing state
+                    ms.type4_angle = 0
+                    ms.type4_angle_step = 0
             elif typ == 9:
                 flags = (ms.record_flags | 5) & 0xFF
                 ms.x_step = 0
@@ -2155,7 +2226,11 @@ class RuntimeWorld:
         if obj.monster_state < 10:
             self._monster_reset_or_despawn(obj, ms)
         else:
-            self._monster_reset_or_despawn(obj, ms, permanent=(ms.record_flags & 2) == 0)
+            # blues monster_reset: permanent (record retired) only when the LIVE
+            # flags (m->flags, mutated by the AI) lack bit 2 -- NOT the original
+            # record flags. A killed area enemy flies off with bit 2 set, so the
+            # record stays alive and respawns.
+            self._monster_reset_or_despawn(obj, ms, permanent=(obj.monster_flags & 2) == 0)
 
     def _tile_monster_offset(self, tile_num: int, obj: RuntimeObject) -> int:
         attr = self.level.tile_attributes3[tile_num]
@@ -2226,7 +2301,8 @@ class RuntimeWorld:
             if obj.y_velocity < 240:
                 obj.y_velocity += 15
         else:
-            self._monster_reset_or_despawn(obj, ms, permanent=(ms.record_flags & 2) == 0)
+            # blues monster_reset uses the LIVE flags for the permanent decision.
+            self._monster_reset_or_despawn(obj, ms, permanent=(obj.monster_flags & 2) == 0)
 
     def _update_monster_ai(self, obj: RuntimeObject, ms: RuntimeMonsterState) -> None:
         typ = ms.movement_type
@@ -2294,6 +2370,31 @@ class RuntimeWorld:
                     self._monster_change_next_anim(obj)
             elif state == 2 and obj.x < 0:
                 obj.x_velocity = -obj.x_velocity
+            return
+        if typ == 4:  # swinging / rotating hanging spider (blues monster_func1_type4)
+            radius = int(ms.extra.get("swing_radius_px", 0))
+            limit = int(ms.extra.get("swing_angle_limit", 0))
+            if state == 0:
+                if self._monster_next_tick(ms):
+                    return
+                dy = obj.y - ms.y_pos
+                if radius > dy:
+                    obj.y += 2  # lower until the string reaches full length
+                else:
+                    obj.monster_state = 1
+            elif state == 1:
+                self._monster_rotate_pos(obj, ms, radius)
+                ms.type4_angle = (ms.type4_angle + 4) & 0xFF
+                if ms.type4_angle >= limit:
+                    ms.type4_angle = limit
+                    obj.monster_state = 2
+            elif state == 2:
+                self._monster_rotate_pos(obj, ms, radius)
+                if ms.type4_angle & 0x80:
+                    ms.type4_angle_step += 1
+                else:
+                    ms.type4_angle_step -= 1
+                ms.type4_angle = (ms.type4_angle + ms.type4_angle_step) & 0xFF
             return
         if typ == 5:
             if state == 0:
@@ -2733,7 +2834,7 @@ class RuntimeWorld:
             # Non-respawning death: scatter 6 bones like level_monster_die()
             # (level_add_object23_bonus -> alternating velocities, TTL 198).
             self._add_object23_bonus(0x2046, obj.x, obj.y, 48, -128, 6)
-            self._monster_reset_or_despawn(obj, ms, permanent=(ms.record_flags & 2) == 0)
+            self._monster_reset_or_despawn(obj, ms, permanent=(obj.monster_flags & 2) == 0)
         else:
             # Respawning monster: switch to the death animation and fling it
             # off-screen (it then falls via the state==0xFF gravity path).
@@ -2937,6 +3038,11 @@ class RuntimeWorld:
         for obj in self.runtime_objects:
             obj.ipx = obj.x
             obj.ipy = obj.y
+            # Identity so the renderer never interpolates across a slot reuse
+            # (items/bonuses/sparks reassign slots between ticks, which would
+            # otherwise slide a brand-new object out of the old one's position).
+            obj.iact = obj.spr_num != 0xFFFF
+            obj.iref = obj.ref_index if obj.ref_index is not None else -1
 
     @staticmethod
     def _lerp(prev: int, cur: int, a: float) -> int:
@@ -2950,6 +3056,11 @@ class RuntimeWorld:
         a = alpha or 0.0
         cam_x = self._lerp(self._icam_x, self.camera_x, a) if interp else self.camera_x
         cam_y = self._lerp(self._icam_y, self.camera_y, a) if interp else self.camera_y
+        # Screen shake (blues level_shake_screen): a damped vertical jolt while
+        # shake_screen_counter is set (hard landings, big food, big hits).
+        sc = self.player.shake_screen_counter
+        if sc > 1:
+            cam_y += sc if (self.tick_count & 1) else -sc
         self._last_cam = (cam_x, cam_y)
 
         # Static background -> one copy instead of 64000 per-pixel writes.
@@ -2984,8 +3095,16 @@ class RuntimeWorld:
                     tint = _BLINK_WHITE  # hit enemy flashes white
                 elif 23 <= obj.slot <= 54 and obj.ttl > 0 and (self.tick_count & 1):
                     tint = _BLINK_BLACK  # expiring bonus blinks black (like the player)
-                ox = self._lerp(obj.ipx, obj.x, a) if interp else obj.x
-                oyp = self._lerp(obj.ipy, obj.y, a) if interp else obj.y
+                # Interpolate only when this slot held the SAME object last tick
+                # (active then, and the same ref identity); otherwise snap to the
+                # current position so a reused slot doesn't slide.
+                same = (obj.iact and
+                        obj.iref == (obj.ref_index if obj.ref_index is not None else -1))
+                if interp and same:
+                    ox = self._lerp(obj.ipx, obj.x, a)
+                    oyp = self._lerp(obj.ipy, obj.y, a)
+                else:
+                    ox, oyp = obj.x, obj.y
                 self._draw_sprite(frame, obj.spr_num, ox, oyp, anchor_bottom=True, tint=tint, camera=(cam_x, cam_y))
 
         # When hit, the player blinks black during the invincibility window.
