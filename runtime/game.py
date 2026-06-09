@@ -47,6 +47,7 @@ from runtime.original_tables import (
     sprite_logic_size,
     COS_TBL,
     SIN_TBL,
+    SCORE_TBL,
 )
 
 
@@ -72,6 +73,19 @@ PLAY_H = DOS_H - PANEL_H  # 176
 # even though the numbers don't divide evenly.
 TICK_HZ = 21.8
 TILE = 16
+
+# Pre-level "you are here" adventure-map screen (MAP.SQZ, music CARTE.TRK). The
+# map is a 640x200 16-colour planar image the journey crosses left->right; the
+# screen pans to the current level's spot before play. MAP_W is the map width;
+# MARKER_X/Y are the per-level marker position on the map (estimated across the
+# 16 levels — exact values await PRE2.EXE RE, the EXE is DIET-packed). MAP_SCROLL
+# is the pan speed in px/tick; MAP_HOLD is how long the marker is shown before
+# play once the pan settles.
+MAP_W = 640
+MAP_SCROLL = 4
+MAP_HOLD = 44
+MAP_MARKER_X = (60, 100, 150, 200, 250, 300, 340, 380, 420, 455, 490, 520, 550, 575, 600, 620)
+MAP_MARKER_Y = 96
 
 # Runtime constants are deliberately centralized. Values with *16 suffix are
 # original-style 1/16 px per tick units transcribed from blues-master/p2 and
@@ -418,6 +432,8 @@ class RuntimeWorld:
         self.checkpoint_x = int(self.level.header.start_x_pos)
         self.checkpoint_y = int(self.level.header.start_y_pos)
         self._pending_level = None
+        self._complete = None  # level-completed bonuses animation state (or None)
+        self._map_intro = None  # pre-level "you are here" map screen state (or None)
         if not hasattr(self, "score"):
             self.score = 0
         self.platforms = self._init_platform_states()
@@ -1451,6 +1467,303 @@ class RuntimeWorld:
         if obj.slot >= 23:
             self._clear_item_ref(obj)
 
+    # ------------------------------------------------------------------
+    # Pre-level "you are here" adventure-map screen.
+    #
+    # Not present in blues; it IS in the DOS game (assets MAP.SQZ + CARTE.TRK,
+    # neither referenced by blues). It shows before every level (including the
+    # first): the 640x200 world map pans in from the right to the current level's
+    # spot, a marker blinks, and any key skips straight to play. One pan step per
+    # engine tick, so it runs at the DOS logic rate.
+    # ------------------------------------------------------------------
+    def _build_map_image(self) -> None:
+        """Decode MAP.SQZ (640x200 planar 4bpp) once into an RGB image. The map
+        has no embedded palette; the DOS map screen sets one before showing it —
+        the forest level-0 palette reproduces the natural greens/browns (exact
+        map palette pending EXE RE)."""
+        if getattr(self, "_map_image", None) is not None:
+            return
+        try:
+            blob = unpack_file(find_data_file(self.data_dir, "MAP.SQZ"))
+            pixels = decode_planar_bitmap(blob, MAP_W, DOS_H)
+            rgb = vga6_to_rgb(self.palettes[0])
+            img = Image.new("RGB", (MAP_W, DOS_H))
+            img.putdata([rgb[p & 15] for p in pixels])
+            self._map_image = img
+        except Exception:
+            self._map_image = None
+
+    def _begin_map_intro(self) -> None:
+        """Start the pre-level map screen for the current level."""
+        self._build_map_image()
+        if self._map_image is None:
+            return  # asset missing -> just skip straight to play
+        lvl = self.level_index
+        marker_x = MAP_MARKER_X[lvl] if 0 <= lvl < len(MAP_MARKER_X) else MAP_W // 2
+        # Screen x of a map column wx is `wx + offset`. Pan the map in from the
+        # right (offset = +DOS_W -> black screen) to where the marker is centred,
+        # clamped so the map always fills the screen (no black margin).
+        target = max(-(MAP_W - DOS_W), min(0, DOS_W // 2 - marker_x))
+        self._map_intro = {
+            "offset": float(DOS_W),
+            "target": float(target),
+            "marker_x": marker_x,
+            "hold": MAP_HOLD,
+            "settled": False,
+            "armed": False,  # require a key release before a press can skip
+        }
+        try:
+            self.play_music(2)  # CARTE.TRK
+        except Exception:
+            pass
+
+    def _map_intro_finish(self) -> None:
+        self._map_intro = None
+        # Restore the level's own music for gameplay (blues do_level music_tbl).
+        music_tbl = (9, 9, 0, 0, 0, 13, 4, 4, 10, 13, 16, 16, 16, 9, 14, 4)
+        if 0 <= self.level_index < len(music_tbl):
+            try:
+                self.play_music(music_tbl[self.level_index])
+            except Exception:
+                pass
+
+    def _map_intro_tick(self, inp: InputState) -> None:
+        m = self._map_intro
+        key = bool(inp.jump or inp.action or inp.fire or inp.up
+                   or getattr(inp, "quit", False))
+        # Require the key to be released once before a press skips, so a key held
+        # from the previous screen/level doesn't skip instantly.
+        if not key:
+            m["armed"] = True
+        elif m["armed"]:
+            self._map_intro_finish()
+            return
+        if m["offset"] > m["target"]:
+            m["offset"] = max(m["target"], m["offset"] - MAP_SCROLL)
+        else:
+            m["settled"] = True
+            m["hold"] -= 1
+            if m["hold"] <= 0:
+                self._map_intro_finish()
+
+    def _render_map_intro(self) -> Image.Image:
+        frame = Image.new("RGB", (DOS_W, DOS_H), (0, 0, 0))
+        m = self._map_intro
+        off = int(round(m["offset"]))
+        if self._map_image is not None:
+            frame.paste(self._map_image, (off, 0))
+        # Blinking "you are here" marker (drawn once the map is in place).
+        mx = m["marker_x"] + off
+        if -8 < mx < DOS_W + 8 and (self.tick_count & 2):
+            d = ImageDraw.Draw(frame)
+            r = 5
+            d.polygon([(mx, MAP_MARKER_Y - r), (mx + r, MAP_MARKER_Y),
+                       (mx, MAP_MARKER_Y + r), (mx - r, MAP_MARKER_Y)],
+                      fill=(236, 0, 0), outline=(255, 255, 255))
+        return frame
+
+    # ------------------------------------------------------------------
+    # Level-completed bonuses animation (blues level_completed_bonuses_animation)
+    #
+    # After the exit is touched the gameplay tick is replaced by this scripted
+    # animation: the player walks to the left, a cauldron slides in from the
+    # right, the player tosses in every food item collected during the level (one
+    # per ~8 ticks), each landing adding its score_tbl bonus, then everything
+    # slides off. One animation step runs per engine tick, so the whole sequence
+    # plays at the DOS logic rate.
+    # ------------------------------------------------------------------
+    def _start_level_complete(self) -> None:
+        # Convert the player to screen space and freeze the camera at the origin
+        # (blues zeroes tilemap.x/y and subtracts them from the player position).
+        self.player.x -= self.camera_x
+        self.player.y -= self.camera_y
+        self.camera_x = 0
+        self.camera_y = 0
+        self._icam_x = 0
+        self._icam_y = 0
+        self.player.vx = 0
+        self.player.vy = 0
+        self.player.facing = 1  # hdir = 0 -> face right
+        self.player.dying = False
+        self.player.hit_counter = 0
+        self.player.shake_screen_counter = 0
+        # Hide every object; the animation manages slots 2-4 (cauldron) and the
+        # food it tosses in 55-74.
+        for o in self.runtime_objects:
+            o.spr_num = 0xFFFF
+        self._set_anim_seq(1, current=True)
+        self._step_player_anim()
+        try:
+            self.play_music(15)
+        except Exception:
+            pass
+        self._complete = {
+            "phase": "walk_in",
+            "draw_counter": 0,
+            "bp_burst": 0,
+            "bp": 0,
+            "di": 0,
+            "al": 0,
+            "pvx": 0,
+        }
+
+    def _complete_set_pot(self) -> None:
+        o2 = self.runtime_objects[2]
+        o2.x, o2.y, o2.spr_num = 360, 175, 100
+        o3 = self.runtime_objects[3]
+        o3.x, o3.y, o3.spr_num = 360, 148, 98
+        o4 = self.runtime_objects[4]
+        o4.x, o4.y, o4.spr_num = 360, 155, 104
+
+    def _complete_fixup_hearts(self, c: dict) -> None:
+        """blues level_completed_bonuses_animation_fixup_object4_spr_num: cycle
+        the cauldron heart-bubble sprite 104..109 every 4th frame."""
+        if c["draw_counter"] & 3:
+            return
+        o4 = self.runtime_objects[4]
+        spr = (o4.spr_num & 0x1FFF) + 1
+        if spr >= 110:
+            spr = 104
+        o4.spr_num = spr
+
+    def _complete_update_food(self, c: dict) -> int:
+        """blues helper inner body: gravity the flying food, score + despawn the
+        ones that reach the cauldron. Returns the number still in flight."""
+        active = 0
+        for i in range(20):
+            obj = self.runtime_objects[55 + i]
+            if obj.spr_num == 0xFFFF:
+                continue
+            yv = obj.data_y_velocity
+            if yv < 128:
+                yv += 8
+                obj.data_y_velocity = yv
+            obj.y += yv >> 4
+            active += 1
+            if obj.y >= 145:
+                idx = (obj.spr_num & 0x1FFF) - 110
+                if 0 <= idx < len(SCORE_SPR_LUT):
+                    self.score += SCORE_TBL[SCORE_SPR_LUT[idx]]
+                obj.spr_num = 0xFFFF
+                self.play_sound(8)
+        return active
+
+    def _complete_tally_decision(self, c: dict) -> None:
+        """Outer di/al loop of blues level_completed_bonuses_animation: run at a
+        burst boundary, feed the next collected food into a free slot or, when all
+        are spawned and none are still falling, end the tally."""
+        while True:
+            di = c["di"]
+            if di >= 113:
+                di = c["di"] = 0
+            if self.level_items_count[di] != 0:
+                for i in range(20):
+                    obj = self.runtime_objects[55 + i]
+                    if obj.spr_num == 0xFFFF:
+                        obj.spr_num = 110 + di
+                        obj.x = 155
+                        obj.y = 0
+                        obj.data_y_velocity = 0
+                        self.level_items_count[di] -= 1
+                        c["di"] = di + 1
+                        break
+                c["al"] = 0
+                return
+            c["al"] += 1
+            if c["al"] < 113:
+                c["di"] = di + 1
+                continue
+            if c["bp"] == 0:
+                self._complete_enter_outro(c)
+                return
+            c["al"] = 0
+            return
+
+    def _complete_enter_outro(self, c: dict) -> None:
+        c["phase"] = "outro"
+        self._set_anim_seq(1, current=True)
+
+    def _complete_tick(self, inp: InputState) -> None:
+        c = self._complete
+        if getattr(inp, "quit", False):
+            self._complete = None
+            self.load_level(self.level_index + 1)
+            return
+        self._step_player_anim()  # level_update_object_anim(objects_tbl[1].anim)
+        phase = c["phase"]
+
+        if phase == "walk_in":
+            flag = False
+            # X toward 60 (blues moves only when at least 2px to the right).
+            dx = self.player.x - 60
+            x_offs = -2 if dx < 0 else 2
+            if dx >= 2:
+                self.player.x -= x_offs
+                flag = True
+            else:
+                self.player.x = 60
+            # Y toward 175.
+            dy = self.player.y - 175
+            y_offs = -2 if dy < 0 else 2
+            if dy >= 2:
+                self.player.y -= y_offs
+                flag = True
+            else:
+                self.player.y = 175
+            if not flag:
+                c["phase"] = "pot_in"
+                self._complete_set_pot()
+            return
+
+        if phase == "pot_in":
+            self._complete_fixup_hearts(c)
+            for s in (2, 3, 4):
+                self.runtime_objects[s].x -= 3
+            c["draw_counter"] += 1
+            if self.runtime_objects[2].x <= 155:
+                if self.level_items_total != 0:
+                    c["phase"] = "throw"
+                    c["pvx"] = 64
+                    self._set_anim_seq(18, current=True)
+                else:
+                    self._complete_enter_outro(c)
+            return
+
+        if phase == "throw":
+            self._complete_fixup_hearts(c)
+            c["draw_counter"] += 1
+            # blues level_update_player_x_velocity with x_friction = 2.
+            pvx = c["pvx"]
+            pvx = max(0, pvx - (12 >> 2))
+            c["pvx"] = pvx
+            xv = pvx >> 4
+            self.player.x += xv
+            if xv == 0:
+                c["phase"] = "tally"
+                self._set_anim_seq(17, current=True)
+            return
+
+        if phase == "tally":
+            self._complete_fixup_hearts(c)
+            c["bp_burst"] += self._complete_update_food(c)
+            c["draw_counter"] += 1
+            if (c["draw_counter"] & 7) == 0:  # burst boundary
+                c["bp"] = c["bp_burst"]
+                c["bp_burst"] = 0
+                self._complete_tally_decision(c)
+            return
+
+        if phase == "outro":
+            self._complete_fixup_hearts(c)
+            for s in (2, 3, 4):
+                self.runtime_objects[s].x -= 2
+            self.player.x += 3 if self.runtime_objects[4].x < 0 else 2
+            c["draw_counter"] += 1
+            if self.runtime_objects[2].x <= -52:
+                self._complete = None
+                self.load_level(self.level_index + 1)
+            return
+
     def _activate_exit_semaphore(self) -> None:
         """blues lighter pickup: the level-exit semaphore item (runtime sprite
         278, num 225) becomes the active exit (279, num 226) so the player can
@@ -1506,7 +1819,7 @@ class RuntimeWorld:
         # --- special / effect items -------------------------------------
         if num == 226 or num == 258:  # end-of-level / game-completed semaphore
             obj.spr_num = 0xFFFF
-            self._pending_level = self.level_index + 1  # deferred to end-of-tick
+            self._start_level_complete()  # bonus-tally animation, then advance
             return
         if num == 228:  # checkpoint ("washing machine")
             self._trigger_checkpoint(obj)
@@ -1575,12 +1888,20 @@ class RuntimeWorld:
                 obj.x_velocity = x
                 return  # not collected
             idx = num - 57
+            if 0 <= idx < len(self.level_items_count):
+                self.level_items_count[idx] += 1
+                self.level_items_total += 1
             score_num = SCORE_SPR_LUT[idx] + 74 if 0 <= idx < len(SCORE_SPR_LUT) else 74
             self._add_score_object(obj, score_num)
+            if obj.ref_index is not None:  # blues: ref'd food counts toward bonuses
+                self.level_complete_bonuses += 1
             self._consume_item(obj); return
         if num <= 166:  # fruit / score collectibles
             self.play_sound(8)
             idx = num - 57
+            if 0 <= idx < len(self.level_items_count):
+                self.level_items_count[idx] += 1
+                self.level_items_total += 1
             score_num = SCORE_SPR_LUT[idx] + 74 if 0 <= idx < len(SCORE_SPR_LUT) else 74
             self._add_score_object(obj, score_num)
             self._consume_item(obj); return
@@ -1894,6 +2215,16 @@ class RuntimeWorld:
     def tick(self, inp: InputState) -> None:
         self.tick_count += 1
         self.player.frame_tick += 1
+        # Pre-level map screen: pauses gameplay until it pans in and is skipped
+        # or times out (one pan step per tick = DOS pacing).
+        if self._map_intro is not None:
+            self._map_intro_tick(inp)
+            return
+        # Level-completed bonuses animation: takes over the whole tick (one
+        # animation step per engine tick = blues level_sync pacing) until done.
+        if self._complete is not None:
+            self._complete_tick(inp)
+            return
         # Death animation: once dying, play the falling death sprite for ~60
         # frames (blues level_player_death_animation) before restarting.
         if self.player.dying:
@@ -2631,6 +2962,7 @@ class RuntimeWorld:
         """
         self.bonuses_rt: list[list[int]] = []
         self._bonus_draw_counter = 0
+        complete_secrets = 0
         for b in self.level.bonuses:
             pos = b.pos & 0xFFFF
             rec = [pos, b.tile_num0 & 0xFF, b.tile_num1 & 0xFF, b.count & 0xFF]
@@ -2639,7 +2971,15 @@ class RuntimeWorld:
                 if orig is not None:
                     rec[2] = orig
                     self._set_tile_num_at_linear_offset(pos, rec[1])
+                complete_secrets += 1
             self.bonuses_rt.append(rec)
+        # Level-completed bookkeeping (blues level_complete_*/level_current_*/
+        # level_items_count_tbl). complete_secrets = active hidden-tile records.
+        self.level_complete_secrets = complete_secrets
+        self.level_complete_bonuses = 0
+        self.level_current_secrets = 0
+        self.level_items_count = [0] * 128
+        self.level_items_total = 0
 
     def _add_object23_bonus(self, spr_num: int, x: int, y: int, x_vel: int, y_vel: int, count: int) -> None:
         """blues level_add_object23_bonus(): spawn `count` bonus objects fanning
@@ -2691,6 +3031,7 @@ class RuntimeWorld:
         pos = rec[0]
         rec[0] = 0xFFFF
         self._set_tile_num_at_linear_offset(pos, rec[2])
+        self.level_current_secrets += 1  # blues ++level_current_secrets_count
         if rec[1] != rec[2]:
             self._flood_reveal_secret_neighbours(pos)
         return False
@@ -3052,6 +3393,8 @@ class RuntimeWorld:
         return int(prev + d * a)
 
     def render_frame(self, *, debug_overlay: bool = False, alpha: float | None = None) -> Image.Image:
+        if self._complete is not None:
+            return self._render_complete()
         interp = alpha is not None
         a = alpha or 0.0
         cam_x = self._lerp(self._icam_x, self.camera_x, a) if interp else self.camera_x
@@ -3157,6 +3500,15 @@ class RuntimeWorld:
             if len(blob) < o + 96:
                 break
             self._panel_glyphs[num] = self._panel_planar_image(blob[o:o + 96], 16, 12, 0)
+        # Number font used by the level-completed screen (blues video_draw_number:
+        # allfonts + 0x1C70, 16x11 glyphs, num*88 bytes), palette index 0 -> alpha.
+        self._number_glyphs = {}
+        nfnt = 0x1C70
+        for num in range(10):
+            o = nfnt + num * 88
+            if len(blob) < o + 88:
+                break
+            self._number_glyphs[num] = self._panel_planar_image(blob[o:o + 88], 16, 11, 0)
 
     def _draw_panel_number(self, frame: Image.Image, offset: int, num: int) -> None:
         """blues video_draw_panel_number: 8px-aligned x, absolute y in the frame."""
@@ -3166,6 +3518,86 @@ class RuntimeWorld:
         x = (offset % 40) * 8
         y = offset // 40
         frame.paste(glyph, (x, y), glyph)
+
+    @staticmethod
+    def _complete_offset_xy(offset: int) -> tuple[int, int]:
+        """blues screen-byte offset -> pixel (x, y) for the bonus screen."""
+        return (offset * 8) % 320, (offset * 8) // 320
+
+    def _draw_number_glyph(self, frame: Image.Image, offset: int, digit: int) -> None:
+        glyph = self._number_glyphs.get(digit)
+        if glyph is None:
+            return
+        x, y = self._complete_offset_xy(offset)
+        frame.paste(glyph, (x, y), glyph)
+
+    def _blit_sprite_topleft(self, frame: Image.Image, sprite_num: int, x: int, y: int) -> None:
+        """Blit a sprite with its top-left corner at (x, y), exactly as the
+        original video_draw_sprite does (render_add_sprite stores x,y and blits
+        the frame at that corner — the spr_offs/height anchor used by
+        level_draw_objects is NOT applied to direct video_draw_sprite calls)."""
+        base_num = sprite_num & 0x1FFF
+        key = (base_num, self.level_index, 0)
+        spr = self.sprite_cache.get(key)
+        if spr is None:
+            spr = render_sprite_image(self.sprites_blob, self.sprite_tables, self.palette, base_num, transparent_zero=True)
+            self.sprite_cache[key] = spr
+        frame.paste(spr, (x, y), spr)
+
+    def _draw_letter_spr(self, frame: Image.Image, offset: int, code: int) -> None:
+        """blues video_draw_character_spr: draws sprite 241+code at offset's pixel
+        position (used for letters via video_draw_string2 and the '%' glyph)."""
+        x, y = self._complete_offset_xy(offset)
+        self._blit_sprite_topleft(frame, 241 + code, x, y)
+
+    def _draw_string2(self, frame: Image.Image, offset: int, text: str) -> None:
+        for ch in text:
+            if ch != " ":
+                self._draw_letter_spr(frame, offset, ord(ch) - 0x41)
+            offset += 2
+
+    def _complete_draw_score(self, frame: Image.Image) -> None:
+        """blues level_completed_bonuses_animation_draw_score."""
+        self._draw_string2(frame, 0x230, "SCORE")
+        score_digits = 7
+        score = self.score * 10
+        for i in range(score_digits):
+            digit = score % 10
+            score //= 10
+            self._draw_number_glyph(frame, 0x23C + (score_digits - 1 - i) * 2, digit)
+        self._draw_string2(frame, 0x410, "LEVEL COMPLETED")
+        percentage = 100
+        total = self.level_complete_secrets + self.level_complete_bonuses
+        if total != 0:
+            current = self.level_current_secrets  # current_bonuses is always 0
+            percentage = (current * 100) // total
+        for i in range(3):
+            digit = percentage % 10
+            percentage //= 10
+            self._draw_number_glyph(frame, 0x430 + (2 - i) * 2, digit)
+            if percentage == 0:
+                break
+        self._draw_letter_spr(frame, 0x436, 0x1A)  # '%' glyph
+
+    def _render_complete(self) -> Image.Image:
+        """Render one frame of the level-completed bonuses animation: black
+        screen, the cauldron, the tossed food, the player, and the score/percent
+        overlay (blues video_clear + level_draw_objects + draw_score)."""
+        frame = Image.new("RGB", (DOS_W, DOS_H), (0, 0, 0))
+        # Player first (slot 1, behind the cauldron), then the cauldron (2-4),
+        # then the food (55-74) on top, matching the object-table draw order.
+        self._draw_sprite(frame, self._player_sprite_num(), self.player.x, self.player.y,
+                          anchor_bottom=True, camera=(0, 0))
+        for slot in (2, 3, 4):
+            obj = self.runtime_objects[slot]
+            if obj.active and -64 < obj.x < DOS_W + 64:
+                self._draw_sprite(frame, obj.spr_num, obj.x, obj.y, anchor_bottom=True, camera=(0, 0))
+        for slot in range(55, 75):
+            obj = self.runtime_objects[slot]
+            if obj.active:
+                self._draw_sprite(frame, obj.spr_num, obj.x, obj.y, anchor_bottom=True, camera=(0, 0))
+        self._complete_draw_score(frame)
+        return frame
 
     def _draw_hud(self, frame: Image.Image) -> None:
         """Bottom status panel using the original ALLFONTS graphics."""
@@ -3271,6 +3703,7 @@ class GameApp(tk.Tk):
                                 command=self._apply_debug)
         develop.add_separator()
         develop.add_command(label="Restart level (R)", command=lambda: self.world.load_level(self.world.level_index))
+        develop.add_command(label="Trigger level end (bonus screen)", command=self._trigger_level_end)
 
         menubar.add_cascade(label="Develop", menu=develop)
 
@@ -3341,6 +3774,13 @@ class GameApp(tk.Tk):
 
     def _apply_god(self) -> None:
         self.world.god_mode = self._god_var.get()
+
+    def _trigger_level_end(self) -> None:
+        """Develop helper: jump straight into the level-completed bonus screen
+        with whatever food/secrets have been collected so far."""
+        w = self.world
+        if w._complete is None and not w.player.dying and w._trans_phase == 0:
+            w._start_level_complete()
 
     def _apply_debug(self) -> None:
         self.show_debug = self._debug_var.get()
