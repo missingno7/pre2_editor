@@ -14,6 +14,9 @@ from runtime.game import (
     DOS_H,
     DOS_W,
     MAP_MARKER_Y,
+    MODE_LETTER_ADV,
+    MODE_TEXT_Y1,
+    MODE_TEXT_Y2,
     PLAY_H,
     TICK_HZ,
     TILE,
@@ -42,6 +45,8 @@ class PygameSurfaceRenderer:
         self._asset_generation: tuple[int, int] | None = None
         self._bg_surface: Any | None = None
         self._map_surface: Any | None = None
+        self._motif_tiled_surface: Any | None = None
+        self._mode_letter_surfaces: dict[int, Any] = {}
         self._panel_bg_surface: Any | None = None
         self._panel_glyph_surfaces: dict[int, Any] = {}
         self._number_glyph_surfaces: dict[int, Any] = {}
@@ -56,6 +61,8 @@ class PygameSurfaceRenderer:
         self._asset_generation = None
         self._bg_surface = None
         self._map_surface = None
+        self._motif_tiled_surface = None
+        self._mode_letter_surfaces.clear()
         self._panel_bg_surface = None
         self._panel_glyph_surfaces.clear()
         self._number_glyph_surfaces.clear()
@@ -352,51 +359,92 @@ class PygameSurfaceRenderer:
             self.pg.draw.rect(target, (0, 0, 0), (0, 0, left, PLAY_H))
             self.pg.draw.rect(target, (0, 0, 0), (DOS_W - left, 0, left, PLAY_H))
 
-    def _render_map_intro(self) -> Any:
+    def _render_mode_select(self, alpha: float | None = None) -> Any:
+        w = self.world
+        m = w._mode_select
+        a = alpha or 0.0
+        scroll = m["pscroll"] + (m["scroll"] - m["pscroll"]) * a
+        self.frame.fill((0, 0, 0))
+        tiled = getattr(self, "_motif_tiled_surface", None)
+        if tiled is None and getattr(w, "_motif_tiled", None) is not None:
+            tiled = self._motif_tiled_surface = self._surface_from_pil(w._motif_tiled, alpha=False)
+        if tiled is not None:
+            sx = int(scroll) % DOS_W
+            sy = int(scroll) % DOS_H
+            self.frame.blit(tiled, (0, 0), (sx, sy, DOS_W, DOS_H))
+        sel = "EXPERT" if m["sel"] == 1 else "BEGINNER"
+        self._mode_draw_string("MODE", DOS_W // 2, MODE_TEXT_Y1)
+        self._mode_draw_string(sel, DOS_W // 2, MODE_TEXT_Y2)
+        return self.frame
+
+    def _mode_letter_surface(self, code: int) -> Any:
+        cache = self._mode_letter_surfaces
+        s = cache.get(code)
+        if s is None:
+            img = self.world._mode_letter_img(code)
+            s = cache[code] = self._surface_from_pil(img, alpha=True)
+        return s
+
+    def _mode_draw_string(self, text: str, cx: int, y: int) -> None:
+        x = cx - len(text) * MODE_LETTER_ADV // 2
+        for ch in text:
+            if ch != " ":
+                self.frame.blit(self._mode_letter_surface(ord(ch) - 0x41), (x, y))
+            x += MODE_LETTER_ADV
+
+    def _render_map_intro(self, alpha: float | None = None) -> Any:
         self.frame.fill((0, 0, 0))
         m = self.world._map_intro
+        a = alpha or 0.0
+        draw = int(round(m["pdraw"] + (m["draw"] - m["pdraw"]) * a))
         if self.world._map_image is not None:
             if self._map_surface is None:
                 self._map_surface = self._surface_from_pil(self.world._map_image, alpha=False)
-            self.frame.blit(self._map_surface, (int(round(m["offset"])), 0))
-        mx = m["marker_x"] + int(round(m["offset"]))
-        if -8 < mx < DOS_W + 8 and (self.world.tick_count & 2):
-            r = 5
-            self.pg.draw.polygon(
-                self.frame,
-                (236, 0, 0),
-                [(mx, MAP_MARKER_Y - r), (mx + r, MAP_MARKER_Y), (mx, MAP_MARKER_Y + r), (mx - r, MAP_MARKER_Y)],
-            )
-            self.pg.draw.polygon(
-                self.frame,
-                (255, 255, 255),
-                [(mx, MAP_MARKER_Y - r), (mx + r, MAP_MARKER_Y), (mx, MAP_MARKER_Y + r), (mx - r, MAP_MARKER_Y)],
-                width=1,
-            )
+            self.frame.blit(self._map_surface, (draw, 0))
+        # "You are here" marker: the player sprite standing on the level's spot.
+        mx = m["marker_x"] + draw
+        if -16 < mx < DOS_W + 16 and (self.world.tick_count & 4):
+            self._draw_sprite(self.frame, m["marker_spr"], mx, MAP_MARKER_Y, camera=(0, 0))
         return self.frame
 
-    def _render_complete(self) -> Any:
+    def _render_complete(self, alpha: float | None = None) -> Any:
         self.frame.fill((0, 0, 0))
         w = self.world
-        self._draw_sprite(self.frame, w._player_sprite_num(), w.player.x, w.player.y, camera=(0, 0))
-        for slot in (2, 3, 4):
-            obj = w.runtime_objects[slot]
-            if obj.active and -64 < obj.x < DOS_W + 64:
-                self._draw_sprite(self.frame, obj.spr_num, obj.x, obj.y, camera=(0, 0))
+        interp = alpha is not None
+        a = alpha or 0.0
+
+        def pos(obj):
+            if interp and obj.iact:
+                return w._lerp(obj.ipx, obj.x, a), w._lerp(obj.ipy, obj.y, a)
+            return obj.x, obj.y
+
+        # blues level_draw_objects draws high->low, so higher slots are behind:
+        # food (55-74) falls behind the cauldron (2-4); the player (1) is in front.
         for slot in range(55, 75):
             obj = w.runtime_objects[slot]
             if obj.active:
-                self._draw_sprite(self.frame, obj.spr_num, obj.x, obj.y, camera=(0, 0))
+                ox, oy = pos(obj)
+                self._draw_sprite(self.frame, obj.spr_num, ox, oy, camera=(0, 0))
+        for slot in (2, 3, 4):
+            obj = w.runtime_objects[slot]
+            if obj.active and -64 < obj.x < DOS_W + 64:
+                ox, oy = pos(obj)
+                self._draw_sprite(self.frame, obj.spr_num, ox, oy, camera=(0, 0))
+        ppx = w._lerp(w.player.ipx, w.player.x, a) if interp else w.player.x
+        ppy = w._lerp(w.player.ipy, w.player.y, a) if interp else w.player.y
+        self._draw_sprite(self.frame, w._player_sprite_num(), ppx, ppy, camera=(0, 0))
         self._complete_draw_score(self.frame)
         return self.frame
 
     def render(self, alpha: float | None = None) -> Any:
         self._sync_assets()
         w = self.world
+        if w._mode_select is not None:
+            return self._render_mode_select(alpha)
         if w._map_intro is not None:
-            return self._render_map_intro()
+            return self._render_map_intro(alpha)
         if w._complete is not None:
-            return self._render_complete()
+            return self._render_complete(alpha)
 
         interp = alpha is not None
         a = alpha or 0.0
@@ -447,7 +495,34 @@ class PygameSurfaceRenderer:
 
         self._draw_transition(self.frame, a)
         self._draw_hud(self.frame)
+        if w._wipe is not None:
+            self._draw_wipe(self.frame, a)
         return self.frame
+
+    def _draw_wipe(self, target: Any, alpha: float) -> None:
+        """Level-entry curtain open + level-exit iris close (mirrors
+        RuntimeWorld._draw_wipe)."""
+        w = self.world._wipe
+        if w is None:
+            return
+        f = min(1.0, (w["t"] + alpha) / w["dur"])
+        if w["kind"] == "open":
+            revealed = int(f * DOS_W)
+            left = (DOS_W - revealed) // 2
+            self.pg.draw.rect(target, (0, 0, 0), (0, 0, left, DOS_H))
+            self.pg.draw.rect(target, (0, 0, 0), (DOS_W - left, 0, left, DOS_H))
+        else:  # iris close on (cx, cy): visible circle shrinks to nothing
+            cx, cy = w["cx"], w["cy"]
+            max_r = int(max(
+                ((cx - dx) ** 2 + (cy - dy) ** 2) ** 0.5
+                for dx in (0, DOS_W) for dy in (0, DOS_H)
+            ))
+            r = int((1.0 - f) * max_r)
+            overlay = self.pg.Surface((DOS_W, DOS_H), self.pg.SRCALPHA)
+            overlay.fill((0, 0, 0, 255))
+            if r > 0:
+                self.pg.draw.circle(overlay, (0, 0, 0, 0), (cx, cy), r)
+            target.blit(overlay, (0, 0))
 
 
 class PygameGameApp:

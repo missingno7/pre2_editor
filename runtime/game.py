@@ -1,17 +1,12 @@
 from __future__ import annotations
 
 import argparse
-import sys
-import time
-import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import ttk, messagebox
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageDraw
 
 from pre2lib.formats import (
     LEVEL_IDS,
-    LevelData,
     load_background_bitmap,
     load_front_tiles,
     load_level,
@@ -43,7 +38,6 @@ from runtime.original_tables import (
     PLAYER_JUMP_SPR,
     PLAYER_JUMP_Y_DELTA16,
     PLAYER_MAX_FALL16,
-    PLAYER_RUN_ACCEL16,
     PLAYER_RUN_MAX16,
     sprite_logic_size,
     COS_TBL,
@@ -74,6 +68,10 @@ PLAY_H = DOS_H - PANEL_H  # 176
 # even though the numbers don't divide evenly.
 TICK_HZ = 21.8
 TILE = 16
+# blues OBJECTS_COUNT. Slot map: 0 club, 1 player, 2-5 projectiles, 6-10 sparks,
+# 11-22 monsters, 23-54 bonuses, 55-74 items, 75-90 scores, 91-97 decor,
+# 98-102 boss-5 leaves, 103-107 boss-5 body, 108-115 boss energy bars.
+OBJECTS_COUNT = 116
 
 # Pre-level "you are here" adventure-map screen (MAP.SQZ, music CARTE.TRK). The
 # map is a 640x200 16-colour planar image the journey crosses left->right; the
@@ -87,6 +85,41 @@ MAP_SCROLL = 4
 MAP_HOLD = 44
 MAP_MARKER_X = (60, 100, 150, 200, 250, 300, 340, 380, 420, 455, 490, 520, 550, 575, 600, 620)
 MAP_MARKER_Y = 96
+# "You are here" marker sprite frame (a standing player frame; exact DOS frame
+# pending confirmation — see MODE_SELECT/map notes).
+MAP_MARKER_SPR = 0
+
+# Screen wipes (DOS-original, not in blues). On level entry the playfield is
+# revealed by a black curtain opening left+right from the centre (cave-entrance
+# style); on reaching the exit a black iris closes in on the player before the
+# level-completed bonus screen. Durations in ticks (run at the logic rate).
+WIPE_OPEN_FRAMES = 14
+WIPE_IRIS_FRAMES = 18
+
+# Mode-select screen (BEGINNER/EXPERT). The background is MOTIF.SQZ — the real
+# caveman wallpaper image (320x200 16-colour, indices 0-3), scrolled diagonally
+# so it drifts. Its palette is hardcoded in the EXE data (DS-relative, not
+# decodable from the current flat disasm), so the blue scheme here is
+# reconstructed from screenshots; the gold sprite-font letters (indices 6/13/15)
+# match the in-game text. MODE_SCROLL is the wallpaper drift in px/tick: the DOS
+# title/presentation screens animate synced to the VGA vertical retrace (~70 Hz),
+# not the ~21.8 Hz gameplay logic tick this screen runs in, so the per-tick step
+# is scaled up (~70/21.8 ≈ 3.2) to match the real on-screen drift speed.
+MODE_SCROLL = 3.0
+# 16-colour mode-select palette (6-bit VGA). Only the MOTIF indices (0-3, blue)
+# and the letter-font indices (6/13/15, gold) are meaningful.
+_MODE_PALETTE6 = [(0, 0, 0)] * 16
+_MODE_PALETTE6[0] = (16, 24, 48)   # wallpaper background blue (most common index)
+_MODE_PALETTE6[1] = (10, 16, 36)   # caveman body fill (darker blue)
+_MODE_PALETTE6[2] = (28, 36, 60)   # caveman light highlight (lighter blue)
+_MODE_PALETTE6[3] = (5, 9, 24)     # caveman dark outline (dark blue)
+# Mode-select text layout (matches the spaced gold lettering in the screenshots).
+MODE_LETTER_ADV = 24   # px between letters (wider than the 16px bonus-screen font)
+MODE_TEXT_Y1 = 74      # "MODE"
+MODE_TEXT_Y2 = 112     # "BEGINNER" / "EXPERT"
+_MODE_PALETTE6[6] = (10, 6, 0)     # letter dark outline
+_MODE_PALETTE6[13] = (50, 36, 6)   # letter mid gold
+_MODE_PALETTE6[15] = (63, 50, 10)  # letter highlight gold
 
 # Runtime constants are deliberately centralized. Values with *16 suffix are
 # original-style 1/16 px per tick units transcribed from blues-master/p2 and
@@ -401,7 +434,11 @@ class RuntimeWorld:
         self._last_jump_held = False
         self.monster_type0_side = 0
         self.monster_type10_dist = 0
+        self._mode_select = None
         self.load_level(level_index)
+        # First screen on startup: choose BEGINNER/EXPERT; on confirm it sets the
+        # difficulty and begins the first level's map intro.
+        self._begin_mode_select()
 
     def load_level(self, level_index: int) -> None:
         self.level_index = level_index % len(LEVEL_IDS)
@@ -439,16 +476,23 @@ class RuntimeWorld:
         self._pending_level = None
         self._complete = None  # level-completed bonuses animation state (or None)
         self._map_intro = None  # pre-level "you are here" map screen state (or None)
+        # Level-entry curtain-open wipe (cave-entrance style). Reset on every
+        # level load so entering/respawning reveals the playfield.
+        self._wipe = {"kind": "open", "t": 0, "dur": WIPE_OPEN_FRAMES}
         if not hasattr(self, "score"):
             self.score = 0
         self.platforms = self._init_platform_states()
-        self.runtime_objects = [RuntimeObject(slot=i) for i in range(91)]
+        self.runtime_objects = [RuntimeObject(slot=i) for i in range(OBJECTS_COUNT)]
         self.monster_states = self._init_monster_states()
         self.current_hit_object_slot = 6
         self.camera_x = max(0, self.player.x - DOS_W // 2)
         self.camera_y = max(0, self.player.y - DOS_H // 2)
         self._icam_x = self.camera_x
         self._icam_y = self.camera_y
+        # Always defined so the debug overlay can read it even before the first
+        # gameplay frame is rendered (the map intro / wipe render paths return
+        # early and don't set it).
+        self._last_cam = (self.camera_x, self.camera_y)
         self._sync_player_collision_size()
         self._asm_update_player_decor()
         self._update_runtime_items()
@@ -853,7 +897,16 @@ class RuntimeWorld:
             x_pos = self.player.x >> 4
         below_ty = y_pos + 1
         tile = self.tile_num_at_tile(x_pos, below_ty)
-        attr1 = self.level.tile_attributes1[tile] if tile is not None else 1
+        if tile is not None:
+            attr1 = self.level.tile_attributes1[tile]
+        elif below_ty >= self.level.height_tiles and 0 <= x_pos < self.level.width_tiles:
+            # Below the map bottom: blues level_get_tile returns 0 here, so the
+            # ground attr is tile 0's (empty) and the player falls off the bottom
+            # edge -> the off-screen check then kills them. (Previously this
+            # defaulted to solid=1, leaving an invisible floor at the bottom.)
+            attr1 = self.level.tile_attributes1[0]
+        else:
+            attr1 = 1  # off the sides/top stays solid (keep the player in bounds)
 
         # level_update_tile0() also animates/decrements one special tile under
         # the player's origin when attr2 bit 0x20 is set.  This is visual state,
@@ -1479,6 +1532,116 @@ class RuntimeWorld:
             self._clear_item_ref(obj)
 
     # ------------------------------------------------------------------
+    # Mode-select screen (BEGINNER / EXPERT) — the first screen on startup.
+    #
+    # Not in blues; reconstructed from the DOS game. Background is MOTIF.SQZ (the
+    # scrolling caveman wallpaper). Up/Down toggles the choice, a key confirms ->
+    # sets `expert` and drops into the first level's map intro. The state machine
+    # advances one step per engine tick (DOS logic rate).
+    # ------------------------------------------------------------------
+    def _build_mode_assets(self) -> None:
+        if getattr(self, "_motif_img", None) is not None:
+            return
+        self._mode_palette = [c for t in _MODE_PALETTE6 for c in t]  # flat 48 (6-bit)
+        rgb = vga6_to_rgb(self._mode_palette)
+        try:
+            blob = unpack_file(find_data_file(self.data_dir, "MOTIF.SQZ"))
+            px = decode_planar_bitmap(blob, DOS_W, DOS_H)
+            base = Image.new("RGB", (DOS_W, DOS_H))
+            base.putdata([rgb[p & 15] for p in px])
+            # 2x2 tile so a scrolled DOS_W x DOS_H window always wraps seamlessly.
+            tiled = Image.new("RGB", (DOS_W * 2, DOS_H * 2))
+            for ox in (0, DOS_W):
+                for oy in (0, DOS_H):
+                    tiled.paste(base, (ox, oy))
+            self._motif_img = base
+            self._motif_tiled = tiled
+        except Exception:
+            self._motif_img = None
+            self._motif_tiled = None
+
+    def _begin_mode_select(self) -> None:
+        self._build_mode_assets()
+        self._mode_select = {
+            "sel": 0,          # 0 = BEGINNER, 1 = EXPERT
+            "scroll": 0.0,
+            "pscroll": 0.0,
+            "armed": False,
+        }
+        try:
+            self.play_music(1)  # CODE.TRK — the mode-select track (user-confirmed)
+        except Exception:
+            pass
+
+    def _mode_select_tick(self, inp: InputState) -> None:
+        m = self._mode_select
+        m["pscroll"] = m["scroll"]
+        m["scroll"] += MODE_SCROLL
+        up = bool(inp.up)
+        down = bool(inp.down)
+        confirm = bool(inp.jump or inp.action or inp.fire)
+        if not (up or down or confirm):
+            m["armed"] = True
+            return
+        if not m["armed"]:
+            return
+        if up or down:
+            m["sel"] ^= 1
+            m["armed"] = False
+        elif confirm:
+            self.expert = (m["sel"] == 1)
+            self._mode_select = None
+            self._begin_map_intro()
+
+    # ------------------------------------------------------------------
+    # Screen wipes: level-entry curtain open + level-exit iris close.
+    # ------------------------------------------------------------------
+    def _start_exit_iris(self) -> None:
+        """Begin the black iris that closes in on the player on level exit; when
+        it is fully shut it hands off to the level-completed bonus screen."""
+        cx = int(self.player.x - self.camera_x)
+        cy = int(self.player.y - self.camera_y - 16)  # ~player body centre
+        self._wipe = {
+            "kind": "iris", "t": 0, "dur": WIPE_IRIS_FRAMES,
+            "cx": cx, "cy": cy, "after": self._start_level_complete,
+        }
+
+    def _wipe_tick(self) -> None:
+        w = self._wipe
+        w["t"] += 1
+        # Keep prev == cur so the frozen frame under the wipe doesn't interpolate.
+        self.snapshot_prev()
+        if w["t"] >= w["dur"]:
+            after = w.get("after")
+            self._wipe = None
+            if after is not None:
+                after()
+
+    def _draw_wipe(self, frame: Image.Image, alpha: float) -> None:
+        w = self._wipe
+        if w is None:
+            return
+        f = min(1.0, (w["t"] + alpha) / w["dur"])
+        if w["kind"] == "open":
+            # Black curtain receding from the centre to the edges (reveal).
+            revealed = int(f * DOS_W)
+            left = (DOS_W - revealed) // 2
+            draw = ImageDraw.Draw(frame)
+            draw.rectangle((0, 0, left, DOS_H), fill=(0, 0, 0))
+            draw.rectangle((DOS_W - left, 0, DOS_W, DOS_H), fill=(0, 0, 0))
+        else:  # iris close on (cx, cy): visible circle shrinks to nothing
+            cx, cy = w["cx"], w["cy"]
+            max_r = int(max(
+                ((cx - dx) ** 2 + (cy - dy) ** 2) ** 0.5
+                for dx in (0, DOS_W) for dy in (0, DOS_H)
+            ))
+            r = int((1.0 - f) * max_r)
+            mask = Image.new("L", (DOS_W, DOS_H), 255)  # 255 -> covered by black
+            if r > 0:
+                ImageDraw.Draw(mask).ellipse((cx - r, cy - r, cx + r, cy + r), fill=0)
+            frame.paste(Image.new("RGB", (DOS_W, DOS_H), (0, 0, 0)), (0, 0), mask)
+
+    # ------------------------------------------------------------------
     # Pre-level "you are here" adventure-map screen.
     #
     # Not present in blues; it IS in the DOS game (assets MAP.SQZ + CARTE.TRK,
@@ -1505,22 +1668,32 @@ class RuntimeWorld:
             self._map_image = None
 
     def _begin_map_intro(self) -> None:
-        """Start the pre-level map screen for the current level."""
+        """Start the pre-level map screen for the current level.
+
+        Screen x of map column wx is `wx + draw`. The screen starts black with the
+        map fully off the RIGHT edge (draw = +DOS_W); the map then appears from the
+        right and scrolls LEFT (draw decreasing) all the way to the end of the map
+        (draw = -span, the far right end of the world on screen), so the whole
+        journey pans past."""
         self._build_map_image()
         if self._map_image is None:
             return  # asset missing -> just skip straight to play
         lvl = self.level_index
         marker_x = MAP_MARKER_X[lvl] if 0 <= lvl < len(MAP_MARKER_X) else MAP_W // 2
-        # Screen x of a map column wx is `wx + offset`. Pan the map in from the
-        # right (offset = +DOS_W -> black screen) to where the marker is centred,
-        # clamped so the map always fills the screen (no black margin).
-        target = max(-(MAP_W - DOS_W), min(0, DOS_W // 2 - marker_x))
+        span = MAP_W - DOS_W  # 320: furthest the map can scroll on screen
+        target = float(-span)  # scroll all the way to the end of the map
+        start = float(DOS_W)  # black: map off the right edge, slides in from right
+        # "You are here" marker sprite. DOS uses a dedicated player frame here
+        # (NOT the gameplay idle frame 9); the exact frame is in the unreadable EXE
+        # data, so MAP_MARKER_SPR is a best-guess standing frame pending confirmation.
+        marker_spr = MAP_MARKER_SPR
         self._map_intro = {
-            "offset": float(DOS_W),
+            "draw": float(start),
+            "pdraw": float(start),
             "target": float(target),
             "marker_x": marker_x,
+            "marker_spr": marker_spr,
             "hold": MAP_HOLD,
-            "settled": False,
             "armed": False,  # require a key release before a press can skip
         }
         try:
@@ -1549,28 +1722,61 @@ class RuntimeWorld:
         elif m["armed"]:
             self._map_intro_finish()
             return
-        if m["offset"] > m["target"]:
-            m["offset"] = max(m["target"], m["offset"] - MAP_SCROLL)
+        m["pdraw"] = m["draw"]
+        if m["draw"] < m["target"]:
+            m["draw"] = min(m["target"], m["draw"] + MAP_SCROLL)
+        elif m["draw"] > m["target"]:
+            m["draw"] = max(m["target"], m["draw"] - MAP_SCROLL)
         else:
-            m["settled"] = True
             m["hold"] -= 1
             if m["hold"] <= 0:
                 self._map_intro_finish()
 
-    def _render_map_intro(self) -> Image.Image:
+    def _mode_letter_img(self, code: int) -> Image.Image | None:
+        cache = getattr(self, "_mode_letter_cache", None)
+        if cache is None:
+            cache = self._mode_letter_cache = {}
+        img = cache.get(code)
+        if img is None:
+            img = render_sprite_image(self.sprites_blob, self.sprite_tables,
+                                      self._mode_palette, 241 + code, transparent_zero=True)
+            cache[code] = img
+        return img
+
+    def _mode_draw_string(self, frame: Image.Image, text: str, cx: int, y: int) -> None:
+        x = cx - len(text) * MODE_LETTER_ADV // 2
+        for ch in text:
+            if ch != " ":
+                glyph = self._mode_letter_img(ord(ch) - 0x41)
+                if glyph is not None:
+                    frame.paste(glyph, (x, y), glyph)
+            x += MODE_LETTER_ADV
+
+    def _render_mode_select(self, alpha: float | None = None) -> Image.Image:
+        m = self._mode_select
+        a = alpha or 0.0
+        scroll = m["pscroll"] + (m["scroll"] - m["pscroll"]) * a
+        frame = Image.new("RGB", (DOS_W, DOS_H), (0, 0, 0))
+        if getattr(self, "_motif_tiled", None) is not None:
+            sx = int(scroll) % DOS_W
+            sy = int(scroll) % DOS_H
+            frame.paste(self._motif_tiled.crop((sx, sy, sx + DOS_W, sy + DOS_H)), (0, 0))
+        self._mode_draw_string(frame, "MODE", DOS_W // 2, MODE_TEXT_Y1)
+        self._mode_draw_string(frame, "EXPERT" if m["sel"] == 1 else "BEGINNER", DOS_W // 2, MODE_TEXT_Y2)
+        return frame
+
+    def _render_map_intro(self, alpha: float | None = None) -> Image.Image:
         frame = Image.new("RGB", (DOS_W, DOS_H), (0, 0, 0))
         m = self._map_intro
-        off = int(round(m["offset"]))
+        a = alpha or 0.0
+        draw = int(round(m["pdraw"] + (m["draw"] - m["pdraw"]) * a))
         if self._map_image is not None:
-            frame.paste(self._map_image, (off, 0))
-        # Blinking "you are here" marker (drawn once the map is in place).
-        mx = m["marker_x"] + off
-        if -8 < mx < DOS_W + 8 and (self.tick_count & 2):
-            d = ImageDraw.Draw(frame)
-            r = 5
-            d.polygon([(mx, MAP_MARKER_Y - r), (mx + r, MAP_MARKER_Y),
-                       (mx, MAP_MARKER_Y + r), (mx - r, MAP_MARKER_Y)],
-                      fill=(236, 0, 0), outline=(255, 255, 255))
+            frame.paste(self._map_image, (draw, 0))
+        # "You are here" marker: the player sprite standing on the level's spot.
+        mx = m["marker_x"] + draw
+        if -16 < mx < DOS_W + 16 and (self.tick_count & 4):  # gentle blink
+            self._draw_sprite(frame, m["marker_spr"], mx, MAP_MARKER_Y,
+                              anchor_bottom=True, camera=(0, 0))
         return frame
 
     # ------------------------------------------------------------------
@@ -1699,6 +1905,7 @@ class RuntimeWorld:
         if getattr(inp, "quit", False):
             self._complete = None
             self.load_level(self.level_index + 1)
+            self._begin_map_intro()
             return
         self._step_player_anim()  # level_update_object_anim(objects_tbl[1].anim)
         phase = c["phase"]
@@ -1773,6 +1980,7 @@ class RuntimeWorld:
             if self.runtime_objects[2].x <= -52:
                 self._complete = None
                 self.load_level(self.level_index + 1)
+                self._begin_map_intro()
             return
 
     def _activate_exit_semaphore(self) -> None:
@@ -1830,7 +2038,7 @@ class RuntimeWorld:
         # --- special / effect items -------------------------------------
         if num == 226 or num == 258:  # end-of-level / game-completed semaphore
             obj.spr_num = 0xFFFF
-            self._start_level_complete()  # bonus-tally animation, then advance
+            self._start_exit_iris()  # iris-close on the player -> bonus screen
             return
         if num == 228:  # checkpoint ("washing machine")
             self._trigger_checkpoint(obj)
@@ -2226,10 +2434,19 @@ class RuntimeWorld:
     def tick(self, inp: InputState) -> None:
         self.tick_count += 1
         self.player.frame_tick += 1
+        # Mode-select (BEGINNER/EXPERT): the first screen on startup.
+        if self._mode_select is not None:
+            self._mode_select_tick(inp)
+            return
         # Pre-level map screen: pauses gameplay until it pans in and is skipped
         # or times out (one pan step per tick = DOS pacing).
         if self._map_intro is not None:
             self._map_intro_tick(inp)
+            return
+        # Screen wipes (level-entry curtain open, level-exit iris close) pause
+        # gameplay while they play; the iris hands off to the bonus screen.
+        if self._wipe is not None:
+            self._wipe_tick()
             return
         # Level-completed bonuses animation: takes over the whole tick (one
         # animation step per engine tick = blues level_sync pacing) until done.
@@ -3404,10 +3621,12 @@ class RuntimeWorld:
         return int(prev + d * a)
 
     def render_frame(self, *, debug_overlay: bool = False, alpha: float | None = None) -> Image.Image:
+        if self._mode_select is not None:
+            return self._render_mode_select(alpha)
         if self._map_intro is not None:
-            return self._render_map_intro()
+            return self._render_map_intro(alpha)
         if self._complete is not None:
-            return self._render_complete()
+            return self._render_complete(alpha)
         interp = alpha is not None
         a = alpha or 0.0
         cam_x = self._lerp(self._icam_x, self.camera_x, a) if interp else self.camera_x
@@ -3482,6 +3701,8 @@ class RuntimeWorld:
                     frame.paste(img, (tx * TILE - cam_x, oy), img)
         self._draw_transition(frame, a)
         self._draw_hud(frame)
+        if self._wipe is not None:
+            self._draw_wipe(frame, a)
         return frame
 
     def _panel_planar_image(self, src: bytes, w: int, h: int, transparent: int | None) -> Image.Image:
@@ -3592,23 +3813,41 @@ class RuntimeWorld:
                 break
         self._draw_letter_spr(frame, 0x436, 0x1A)  # '%' glyph
 
-    def _render_complete(self) -> Image.Image:
+    def _render_complete(self, alpha: float | None = None) -> Image.Image:
         """Render one frame of the level-completed bonuses animation: black
-        screen, the cauldron, the tossed food, the player, and the score/percent
-        overlay (blues video_clear + level_draw_objects + draw_score)."""
+        screen, the tossed food, the cauldron, the player, and the score/percent
+        overlay (blues video_clear + level_draw_objects + draw_score).
+
+        blues level_draw_objects draws slots high->low, so higher slots are
+        BEHIND: the food (55-74) falls behind the cauldron (2-4), and the player
+        (slot 1) is in front of the cauldron. `alpha` interpolates the per-tick
+        motion to the display rate (the food fall, the cauldron slide, the walk)."""
+        interp = alpha is not None
+        a = alpha or 0.0
+
+        def pos(obj):
+            # Interpolate unless the slot just (re)appeared this tick.
+            if interp and obj.iact:
+                return self._lerp(obj.ipx, obj.x, a), self._lerp(obj.ipy, obj.y, a)
+            return obj.x, obj.y
+
         frame = Image.new("RGB", (DOS_W, DOS_H), (0, 0, 0))
-        # Player first (slot 1, behind the cauldron), then the cauldron (2-4),
-        # then the food (55-74) on top, matching the object-table draw order.
-        self._draw_sprite(frame, self._player_sprite_num(), self.player.x, self.player.y,
-                          anchor_bottom=True, camera=(0, 0))
-        for slot in (2, 3, 4):
-            obj = self.runtime_objects[slot]
-            if obj.active and -64 < obj.x < DOS_W + 64:
-                self._draw_sprite(frame, obj.spr_num, obj.x, obj.y, anchor_bottom=True, camera=(0, 0))
+        # Food first (behind the cauldron).
         for slot in range(55, 75):
             obj = self.runtime_objects[slot]
             if obj.active:
-                self._draw_sprite(frame, obj.spr_num, obj.x, obj.y, anchor_bottom=True, camera=(0, 0))
+                ox, oy = pos(obj)
+                self._draw_sprite(frame, obj.spr_num, ox, oy, anchor_bottom=True, camera=(0, 0))
+        # Cauldron (slots 2-4) over the food.
+        for slot in (2, 3, 4):
+            obj = self.runtime_objects[slot]
+            if obj.active and -64 < obj.x < DOS_W + 64:
+                ox, oy = pos(obj)
+                self._draw_sprite(frame, obj.spr_num, ox, oy, anchor_bottom=True, camera=(0, 0))
+        # Player in front of the cauldron.
+        ppx = self._lerp(self.player.ipx, self.player.x, a) if interp else self.player.x
+        ppy = self._lerp(self.player.ipy, self.player.y, a) if interp else self.player.y
+        self._draw_sprite(frame, self._player_sprite_num(), ppx, ppy, anchor_bottom=True, camera=(0, 0))
         self._complete_draw_score(frame)
         return frame
 
@@ -3639,308 +3878,12 @@ class RuntimeWorld:
                 self._draw_panel_number(frame, bonus_pos[i], 12 + i)
 
 
-class GameApp(tk.Tk):
-    def __init__(self, project_dir: Path, data_dir: Path, level_index: int = 0, scale: int = 3, *, audio_debug: bool = False) -> None:
-        super().__init__()
-        self.title("Prehistorik 2 runtime RE - run_game")
-        self.scale = max(1, int(scale))
-        self.world = RuntimeWorld(project_dir, data_dir, level_index, audio_debug=audio_debug)
-        self.input = InputState()
-        self.running = True
-        self.show_debug = False  # F1 / Develop menu toggles the debug overlay
-        self.interpolate = False  # View menu: render interpolation (engine stays tick-accurate)
-        self.show_fps = False     # View menu: FPS/TPS overlay
-        self.target_fps = 60      # View menu: render cap when interpolating (vsync-like)
-        self.keep_aspect = True   # View menu: keep 320x200 aspect ratio
-        self.integer_scale = True  # View menu: integer-only scaling
-        self.last_tick = time.perf_counter()
-        self.accum = 0.0
-        self.photo: ImageTk.PhotoImage | None = None
-        self._photo_size = (0, 0)
-        self._overlay_items: list[int] = []  # canvas vector overlay item ids
-        self._last_cam = (0, 0)              # camera used by the last render (for overlays)
-        self._disp = (0, 0, float(self.scale), float(self.scale))  # off_x, off_y, sx, sy
-        # FPS / ticks-per-second measurement.
-        self._fps_t0 = time.perf_counter()
-        self._fps_frames = 0
-        self._fps_ticks0 = 0
-        self._fps_text = ""
-
-        self._build_menu()
-        # The canvas fills the (resizable) window; the game image is centred on it
-        # with letterboxing, so the window can be any size.
-        self.resizable(True, True)
-        self.canvas = tk.Canvas(self, bg="black", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
-        self.canvas_image = None
-        self._bind_keys()
-        self.geometry(f"{DOS_W * self.scale}x{DOS_H * self.scale}")
-        self.after(0, self._main_loop)
-
-    def _display_size(self, win_w: int, win_h: int) -> tuple[int, int]:
-        """Output (width, height) for the game image given the window size and
-        the keep-aspect / integer-scaling toggles."""
-        if not self.keep_aspect:
-            return max(1, win_w), max(1, win_h)
-        if self.integer_scale:
-            s = max(1, min(win_w // DOS_W, win_h // DOS_H))
-            return DOS_W * s, DOS_H * s
-        s = min(win_w / DOS_W, win_h / DOS_H)
-        return max(1, int(DOS_W * s)), max(1, int(DOS_H * s))
-
-    def _build_menu(self) -> None:
-        menubar = tk.Menu(self)
-        develop = tk.Menu(menubar, tearoff=0)
-
-        # Difficulty (beginner / expert)
-        self._difficulty_var = tk.StringVar(value="expert" if self.world.expert else "beginner")
-        diff = tk.Menu(develop, tearoff=0)
-        for label, val in (("Beginner", "beginner"), ("Expert", "expert")):
-            diff.add_radiobutton(label=label, value=val, variable=self._difficulty_var,
-                                 command=self._apply_difficulty)
-        develop.add_cascade(label="Difficulty", menu=diff)
-
-        # Level selector
-        self._level_var = tk.IntVar(value=self.world.level_index)
-        levels = tk.Menu(develop, tearoff=0)
-        for i in range(len(LEVEL_IDS)):
-            levels.add_radiobutton(label="Level %d" % (i + 1), value=i, variable=self._level_var,
-                                   command=self._apply_level)
-        develop.add_cascade(label="Level", menu=levels)
-
-        develop.add_separator()
-        self._god_var = tk.BooleanVar(value=self.world.god_mode)
-        develop.add_checkbutton(label="God mode", variable=self._god_var, command=self._apply_god)
-        self._debug_var = tk.BooleanVar(value=self.show_debug)
-        develop.add_checkbutton(label="Debug overlay (F1)", variable=self._debug_var,
-                                command=self._apply_debug)
-        develop.add_separator()
-        develop.add_command(label="Restart level (R)", command=lambda: self.world.load_level(self.world.level_index))
-        develop.add_command(label="Trigger level end (bonus screen)", command=self._trigger_level_end)
-
-        menubar.add_cascade(label="Develop", menu=develop)
-
-        # View menu
-        view = tk.Menu(menubar, tearoff=0)
-        self._interp_var = tk.BooleanVar(value=self.interpolate)
-        view.add_checkbutton(label="Interpolation (smooth FPS)", variable=self._interp_var,
-                             command=self._apply_interp)
-        self._fps_var = tk.BooleanVar(value=self.show_fps)
-        view.add_checkbutton(label="FPS / ticks overlay", variable=self._fps_var,
-                             command=self._apply_fps)
-        # Frame-rate cap for interpolation (vsync-like target).
-        self._fpscap_var = tk.IntVar(value=self.target_fps)
-        fr = tk.Menu(view, tearoff=0)
-        for cap in (30, 50, 60, 75, 120, 144):
-            fr.add_radiobutton(label="%d FPS" % cap, value=cap, variable=self._fpscap_var,
-                               command=self._apply_fpscap)
-        fr.add_radiobutton(label="Uncapped", value=0, variable=self._fpscap_var, command=self._apply_fpscap)
-        view.add_cascade(label="Frame rate (interpolation)", menu=fr)
-        view.add_separator()
-        self._aspect_var = tk.BooleanVar(value=self.keep_aspect)
-        view.add_checkbutton(label="Keep aspect ratio", variable=self._aspect_var, command=self._apply_aspect)
-        self._intscale_var = tk.BooleanVar(value=self.integer_scale)
-        view.add_checkbutton(label="Integer scaling", variable=self._intscale_var, command=self._apply_intscale)
-        menubar.add_cascade(label="View", menu=view)
-
-        # Audio menu
-        audio = tk.Menu(menubar, tearoff=0)
-        self._sound_var = tk.BooleanVar(value=self.world.sound.sound_enabled)
-        self._music_var = tk.BooleanVar(value=self.world.sound.music_enabled)
-        audio.add_checkbutton(label="Sound effects", variable=self._sound_var, command=self._apply_sound)
-        audio.add_checkbutton(label="Music", variable=self._music_var, command=self._apply_music)
-        menubar.add_cascade(label="Audio", menu=audio)
-        self.config(menu=menubar)
-
-    def _apply_interp(self) -> None:
-        self.interpolate = self._interp_var.get()
-
-    def _apply_fps(self) -> None:
-        self.show_fps = self._fps_var.get()
-
-    def _apply_fpscap(self) -> None:
-        self.target_fps = self._fpscap_var.get()
-
-    def _apply_aspect(self) -> None:
-        self.keep_aspect = self._aspect_var.get()
-
-    def _apply_intscale(self) -> None:
-        self.integer_scale = self._intscale_var.get()
-
-    def _apply_sound(self) -> None:
-        self.world.sound.sound_enabled = self._sound_var.get()
-
-    def _apply_music(self) -> None:
-        en = self._music_var.get()
-        self.world.sound.music_enabled = en
-        if en:
-            self.world.sound.resume_music()
-        else:
-            self.world.sound.stop_music()
-
-    def _apply_difficulty(self) -> None:
-        self.world.expert = (self._difficulty_var.get() == "expert")
-        self.world.load_level(self.world.level_index)  # respawn with new monster set
-
-    def _apply_level(self) -> None:
-        self.world.load_level(self._level_var.get())
-
-    def _apply_god(self) -> None:
-        self.world.god_mode = self._god_var.get()
-
-    def _trigger_level_end(self) -> None:
-        """Develop helper: jump straight into the level-completed bonus screen
-        with whatever food/secrets have been collected so far."""
-        w = self.world
-        if w._complete is None and not w.player.dying and w._trans_phase == 0:
-            w._start_level_complete()
-
-    def _apply_debug(self) -> None:
-        self.show_debug = self._debug_var.get()
-
-    def _bind_keys(self) -> None:
-        pairs = {
-            "Left": "left", "Right": "right", "Up": "up", "Down": "down",
-            "a": "left", "d": "right", "w": "up", "s": "down",
-            "space": "fire", "Control_L": "fire", "Control_R": "fire", "Return": "action",
-        }
-        for key, attr in pairs.items():
-            self.bind(f"<{key}>", lambda e, a=attr: self._set_input(a, True))
-            self.bind(f"<KeyRelease-{key}>", lambda e, a=attr: self._set_input(a, False))
-        self.bind("<F1>", lambda _e: self._toggle_debug())
-        self.bind("<r>", lambda _e: self.world.load_level(self.world.level_index))
-        self.bind("<bracketleft>", lambda _e: self._change_level(-1))
-        self.bind("<bracketright>", lambda _e: self._change_level(1))
-        self.bind("<Escape>", lambda _e: self.destroy())
-
-    def _set_input(self, attr: str, value: bool) -> None:
-        setattr(self.input, attr, value)
-
-    def _toggle_debug(self) -> None:
-        self.show_debug = not self.show_debug
-        self._debug_var.set(self.show_debug)
-
-    def _change_level(self, delta: int) -> None:
-        self.world.load_level((self.world.level_index + delta) % len(LEVEL_IDS))
-        self._level_var.set(self.world.level_index)
-
-    def _main_loop(self) -> None:
-        frame_start = time.perf_counter()
-        # --- fixed-timestep logic ---------------------------------------
-        now = frame_start
-        self.accum += now - self.last_tick
-        self.last_tick = now
-        step = 1.0 / TICK_HZ
-        self.accum = min(self.accum, step * 5)  # cap catch-up after a stall
-        ticked = False
-        while self.accum >= step:
-            self.world.snapshot_prev()  # frame-1 state for interpolation
-            self.world.tick(self.input)
-            self.accum -= step
-            ticked = True
-
-        # --- present ----------------------------------------------------
-        # Without interpolation: draw once per tick (so FPS == TPS exactly).
-        # With interpolation: draw every loop, blending frame-1 -> frame-2 by
-        # the leftover fraction of the tick.
-        if self.interpolate:
-            self._present(self.accum / step)
-        elif ticked:
-            self._present(None)
-
-        # --- schedule next frame (compensate for this frame's work time) ---
-        if self.interpolate and self.target_fps > 0:
-            target_ms = 1000.0 / self.target_fps
-        elif self.interpolate:
-            target_ms = 1.0  # uncapped
-        else:
-            # Poll a bit faster than the tick so each tick is presented promptly.
-            target_ms = 1000.0 / (TICK_HZ * 1.5)
-        work_ms = (time.perf_counter() - frame_start) * 1000.0
-        self.after(max(1, round(target_ms - work_ms)), self._main_loop)
-
-    def _present(self, alpha: float | None) -> None:
-        img = self.world.render_frame(debug_overlay=False, alpha=alpha)
-        self._last_cam = self.world._last_cam
-        win_w = max(1, self.canvas.winfo_width())
-        win_h = max(1, self.canvas.winfo_height())
-        out_w, out_h = self._display_size(win_w, win_h)
-        if (out_w, out_h) != (DOS_W, DOS_H):
-            img = img.resize((out_w, out_h), Image.Resampling.NEAREST)
-        off_x = (win_w - out_w) // 2
-        off_y = (win_h - out_h) // 2
-        self._disp = (off_x, off_y, out_w / DOS_W, out_h / DOS_H)
-        # Reuse the PhotoImage buffer (paste) unless its size changed -- a large
-        # win in the PIL -> Tk pipeline.
-        if self.photo is None or self._photo_size != (out_w, out_h):
-            self.photo = ImageTk.PhotoImage(img)
-            self._photo_size = (out_w, out_h)
-            if self.canvas_image is None:
-                self.canvas_image = self.canvas.create_image(off_x, off_y, anchor="nw", image=self.photo)
-            else:
-                self.canvas.itemconfig(self.canvas_image, image=self.photo)
-        else:
-            self.photo.paste(img)
-        self.canvas.coords(self.canvas_image, off_x, off_y)
-
-        # FPS / TPS measurement.
-        self._fps_frames += 1
-        dt = time.perf_counter() - self._fps_t0
-        if dt >= 0.5:
-            fps = self._fps_frames / dt
-            tps = (self.world.tick_count - self._fps_ticks0) / dt
-            self._fps_text = f"{fps:3.0f} fps   {tps:3.0f} tps"
-            self._fps_t0 = time.perf_counter()
-            self._fps_frames = 0
-            self._fps_ticks0 = self.world.tick_count
-        self._update_overlays()
-
-    def _update_overlays(self) -> None:
-        """All overlays live on the Tk canvas as independent vector items, above
-        the game image -- never drawn into the game pixels."""
-        for item in self._overlay_items:
-            self.canvas.delete(item)
-        self._overlay_items.clear()
-        off_x, off_y, sx, sy = self._disp
-        if self.show_fps:
-            text = self._fps_text or "-- fps   -- tps"
-            self._overlay_items.append(
-                self.canvas.create_text(off_x + 5, off_y + 4, anchor="nw", text=text,
-                                        fill="#00ff00", font=("Consolas", 9, "bold")))
-        if self.show_debug:
-            self._draw_debug_overlay_items(off_x, off_y, sx, sy)
-
-    def _draw_debug_overlay_items(self, off_x: float, off_y: float, sx: float, sy: float) -> None:
-        p = self.world.player
-        cam_x, cam_y = self._last_cam
-
-        def scr(wx, wy):  # world -> screen
-            return off_x + (wx - cam_x) * sx, off_y + (wy - cam_y) * sy
-
-        px0, py0 = scr(p.x, p.y)
-        dx = 9 if p.vx > 0 else (-9 if p.vx < 0 else 0)
-        probe_x = px0 + dx * sx
-        top = py0 - p.collision_h * sy
-        add = self._overlay_items.append
-        add(self.canvas.create_line(px0 - 4 * sx, py0, px0 + 4 * sx, py0, fill="#ff0000"))
-        add(self.canvas.create_line(px0, py0 - 4 * sy, px0, py0 + 4 * sy, fill="#ff0000"))
-        add(self.canvas.create_line(probe_x, py0, probe_x, top, fill="#00ffff"))
-        tx0, ty0 = scr((p.x >> 4) * 16, (p.y >> 4) * 16)
-        add(self.canvas.create_rectangle(tx0, ty0, tx0 + 16 * sx, ty0 + 16 * sy, outline="#ffff00"))
-        add(self.canvas.create_text(
-            off_x + 5, off_y + DOS_H * sy - 14, anchor="sw", fill="#ffffff", font=("Consolas", 8),
-            text=(f"L{self.world.level.level_id} t={self.world.tick_count} "
-                  f"pos=({p.x},{p.y}) v=({p.vx},{p.vy}) g={int(p.on_ground)} "
-                  f"spr={p.spr_num & 0x1FFF} anim={p.current_anim_num} noj={p.nojump_counter}")))
-
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the Prehistorik 2 gameplay reverse-engineering runtime.")
     parser.add_argument("game_data", nargs="?", default="game_data", help="Folder containing original PRE2 game data")
     parser.add_argument("--level", type=int, default=1, help="1-based level number/ID index, default: 1")
     parser.add_argument("--scale", type=int, default=3, help="Integer nearest-neighbour window scale")
-    parser.add_argument("--backend", choices=("auto", "pygame", "tk"), default="auto",
-                        help="Rendering backend: pygame/SDL2 when available, or the original Tk/Pillow path")
     parser.add_argument("--fps", type=int, default=60, help="Target FPS for pygame interpolation mode")
     parser.add_argument("--audio-debug", action="store_true", help="Print pygame mixer/SFX diagnostics to stderr")
     args = parser.parse_args(argv)
@@ -3950,25 +3893,7 @@ def main(argv: list[str] | None = None) -> int:
     if not data_dir.is_absolute():
         data_dir = project_dir / data_dir
     level_index = max(0, args.level - 1)
-    if args.backend in ("auto", "pygame"):
-        try:
-            from runtime.pygame_backend import run_pygame_app
-            return run_pygame_app(project_dir, data_dir, level_index, args.scale, args.fps, audio_debug=args.audio_debug)
-        except ImportError as exc:
-            if args.backend == "pygame":
-                raise
-            print(f"pygame backend unavailable ({exc}); falling back to Tk/Pillow", file=sys.stderr)
-        except Exception as exc:
-            if args.backend == "pygame":
-                raise
-            # If the accelerated backend fails during display initialisation, keep
-            # the old path usable rather than refusing to launch.
-            print(f"pygame backend failed ({exc}); falling back to Tk/Pillow", file=sys.stderr)
-
-    try:
-        app = GameApp(project_dir, data_dir, level_index, args.scale, audio_debug=args.audio_debug)
-    except Exception as exc:
-        messagebox.showerror("run_game failed to start", str(exc))
-        raise
-    app.mainloop()
-    return 0
+    # pygame/SDL2 is the only game backend (the Tk path was removed; Tk lives on
+    # only in the separate editor project). Install it with `pip install pygame`.
+    from runtime.pygame_backend import run_pygame_app
+    return run_pygame_app(project_dir, data_dir, level_index, args.scale, args.fps, audio_debug=args.audio_debug)
