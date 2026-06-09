@@ -75,10 +75,75 @@ def unpack_file(path: str | Path) -> bytes:
         return unpack_eat(data)
     if (sig >> 8) == 0x10:
         return unpack_sqz(data)
-    raise Pre2FormatError(
-        f"{path}: unsupported compression signature 0x{sig:04X}. "
-        "Current editor handles EAT and SQZ."
-    )
+    # Everything else (e.g. SAMPLE.SQZ, signature 0x0000) is the SQV codec,
+    # mirroring the dispatch in the engine's unpack().
+    return unpack_sqv(data)
+
+
+def unpack_sqv(data: bytes) -> bytes:
+    """Decompress the SQV format (dictionary + bitstream RLE) used by the
+    shipped PRE2 sound bank. Direct port of blues p2/unpack.c unpack_sqv."""
+    def u16(o: int) -> int:
+        return data[o] | (data[o + 1] << 8)
+
+    if len(data) < 6:
+        raise Pre2FormatError("SQV file is too short")
+    out_size = (u16(0) << 16) + u16(2)
+    dict_len = u16(4)
+    dict_buf = data[6:6 + dict_len]
+    n = len(data)
+    src = 6 + dict_len
+    out = bytearray()
+    bits = 0
+    bits_count = 1
+    state = 0
+    count = 0
+    prev = 0
+    val = 0
+    while len(out) < out_size:
+        bits_count -= 1
+        if bits_count == 0:
+            if src + 2 > n:
+                break
+            bits = (data[src] << 8) | data[src + 1]
+            src += 2
+            bits_count = 16
+        carry = bits & 0x8000
+        bits = (bits << 1) & 0xFFFF
+        if carry:
+            val += 2
+        if val + 1 >= dict_len:
+            break
+        val = dict_buf[val] | (dict_buf[val + 1] << 8)
+        if (val & 0x8000) == 0:
+            continue
+        val &= 0x7FFF
+        if state == 0:
+            code = val & 0xFF
+            if val >> 8:
+                if code == 0:
+                    state = 1
+                elif code == 1:
+                    state = 2
+                else:
+                    out += bytes((prev,)) * code
+            else:
+                prev = code
+                out.append(code)
+        elif state == 1:
+            out += bytes((prev,)) * val
+            state = 0
+        elif state == 2:
+            count = (val & 0xFF) << 8
+            state = 3
+        else:  # state == 3
+            count |= val & 0xFF
+            out += bytes((prev,)) * count
+            state = 0
+        val = 0
+    if len(out) < out_size:  # pad a trailing shortfall with 8-bit silence
+        out += bytes((0x80,)) * (out_size - len(out))
+    return bytes(out)
 
 
 def unpack_eat(data: bytes) -> bytes:

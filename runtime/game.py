@@ -1284,6 +1284,8 @@ class RuntimeWorld:
 
         if self.player.anim_0x40_flag == 0:
             self.player.club_anim_duration = duration
+            # Club swing sound by club type (blues anim_3_6_7: 5 / 0 / 10).
+            self.play_sound(5 if self.player.club_type == 0 else (0 if self.player.club_type == 1 else 10))
             dy = 0
             if anim_num != 6:
                 dy = -32
@@ -1491,22 +1493,28 @@ class RuntimeWorld:
         if num == 224:
             self.player.club_type = 3; self._consume_item(obj); return
         if num == 174:  # extra life
+            self.play_sound(4)
             self.player.lives += 1
             self._add_score_object(obj, 227); self._consume_item(obj); return
         if num in (167, 168, 458, 459):  # damage
+            self.play_sound(1)
             if self.player.hit_counter == 0:
                 self.player.hit_counter = 44
                 self.player.anim_0x40_flag = 0
             self._consume_item(obj); return
         if num == 169:  # screen kill
+            self.play_sound(0)
             self._kill_all_monsters(bomb=False); self._consume_item(obj); return
         if num == 170:  # bomb
+            self.play_sound(0)
             self._kill_all_monsters(bomb=True); self._consume_item(obj); return
         if num in (180, 181):  # lights on/off (no light state yet)
+            self.play_sound(1)
             self._consume_item(obj); return
 
         # --- collectibles by range --------------------------------------
         if num <= 20:  # bones / small energy food: 6 -> +1 energy heart
+            self.play_sound(8)
             self._consume_item(obj)
             self.player.bonus_energy_counter += 1
             if self.player.bonus_energy_counter >= 6 and self.player.energy != 3:
@@ -1515,13 +1523,16 @@ class RuntimeWorld:
                 self._add_score_object(obj, 226)
             return
         if num <= 44:  # BONUS letters (index 0..4)
+            self.play_sound(8)
             index = num - 39
             if 0 <= index <= 4:
                 self.player.bonus_letters_mask |= (1 << index)
             self._consume_item(obj); return
         if num <= 50:  # utensils
+            self.play_sound(8)
             self._consume_item(obj); return
         if num <= 166:  # food / fruit / score collectibles
+            self.play_sound(4 if num <= 64 else 8)
             idx = num - 57
             score_num = SCORE_SPR_LUT[idx] + 74 if 0 <= idx < len(SCORE_SPR_LUT) else 74
             self._add_score_object(obj, score_num)
@@ -1558,6 +1569,7 @@ class RuntimeWorld:
 
                 # blues: hurt when not a stomp, or moving upward into the monster.
                 if not self._jump_monster_flag or self.player.vy < 0:
+                    self.play_sound(9)  # hurt
                     self.player.hit_counter = 44
                     self.player.anim_0x40_flag = 0
                     self.player.vy = -128
@@ -1573,6 +1585,7 @@ class RuntimeWorld:
                 # Stomp (normal, non-gravity mode): bounce the player and count
                 # the stomp; the monster is NOT killed by jumping — only the club
                 # kills it. Score on every other stomp. (blues 2614-2628.)
+                self.play_sound(3)  # stomp
                 self.player.vy = -224 if self._last_jump_held else -64
                 self.player.jumping_counter = 0
                 self.player.y -= self._collide_y_dist
@@ -2749,6 +2762,7 @@ class RuntimeWorld:
             obj.monster_obj_flags |= 0x40
             obj.monster_energy -= self.player.club_power
             if obj.monster_energy < 0:
+                self.play_sound(2)  # blues level_collide_axe_monsters
                 self._monster_die(obj, attack_obj)
             else:
                 obj.x -= obj.x_velocity >> 2
@@ -3065,7 +3079,6 @@ class GameApp(tk.Tk):
     def __init__(self, project_dir: Path, data_dir: Path, level_index: int = 0, scale: int = 3) -> None:
         super().__init__()
         self.title("Prehistorik 2 runtime RE - run_game")
-        self.resizable(False, False)
         self.scale = max(1, int(scale))
         self.world = RuntimeWorld(project_dir, data_dir, level_index)
         self.input = InputState()
@@ -3074,11 +3087,15 @@ class GameApp(tk.Tk):
         self.interpolate = False  # View menu: render interpolation (engine stays tick-accurate)
         self.show_fps = False     # View menu: FPS/TPS overlay
         self.target_fps = 60      # View menu: render cap when interpolating (vsync-like)
+        self.keep_aspect = True   # View menu: keep 320x200 aspect ratio
+        self.integer_scale = True  # View menu: integer-only scaling
         self.last_tick = time.perf_counter()
         self.accum = 0.0
         self.photo: ImageTk.PhotoImage | None = None
+        self._photo_size = (0, 0)
         self._overlay_items: list[int] = []  # canvas vector overlay item ids
         self._last_cam = (0, 0)              # camera used by the last render (for overlays)
+        self._disp = (0, 0, float(self.scale), float(self.scale))  # off_x, off_y, sx, sy
         # FPS / ticks-per-second measurement.
         self._fps_t0 = time.perf_counter()
         self._fps_frames = 0
@@ -3086,20 +3103,26 @@ class GameApp(tk.Tk):
         self._fps_text = ""
 
         self._build_menu()
-        root = ttk.Frame(self, padding=8)
-        root.pack(fill="both", expand=True)
-        self.canvas = tk.Canvas(root, width=DOS_W * self.scale, height=DOS_H * self.scale, highlightthickness=0)
-        self.canvas.pack()
+        # The canvas fills the (resizable) window; the game image is centred on it
+        # with letterboxing, so the window can be any size.
+        self.resizable(True, True)
+        self.canvas = tk.Canvas(self, bg="black", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
         self.canvas_image = None
-        # width=1 + fill="x": the label fills the (fixed) canvas width but never
-        # requests more, so changing debug text can't resize the window.
-        self.status = ttk.Label(root, anchor="w", width=1)
-        self.status.pack(fill="x", pady=(6, 0))
         self._bind_keys()
-        # Lock the window to its initial layout size so it can't jitter.
-        self.update_idletasks()
-        self.geometry(f"{self.winfo_reqwidth()}x{self.winfo_reqheight()}")
+        self.geometry(f"{DOS_W * self.scale}x{DOS_H * self.scale}")
         self.after(0, self._main_loop)
+
+    def _display_size(self, win_w: int, win_h: int) -> tuple[int, int]:
+        """Output (width, height) for the game image given the window size and
+        the keep-aspect / integer-scaling toggles."""
+        if not self.keep_aspect:
+            return max(1, win_w), max(1, win_h)
+        if self.integer_scale:
+            s = max(1, min(win_w // DOS_W, win_h // DOS_H))
+            return DOS_W * s, DOS_H * s
+        s = min(win_w / DOS_W, win_h / DOS_H)
+        return max(1, int(DOS_W * s)), max(1, int(DOS_H * s))
 
     def _build_menu(self) -> None:
         menubar = tk.Menu(self)
@@ -3148,6 +3171,11 @@ class GameApp(tk.Tk):
                                command=self._apply_fpscap)
         fr.add_radiobutton(label="Uncapped", value=0, variable=self._fpscap_var, command=self._apply_fpscap)
         view.add_cascade(label="Frame rate (interpolation)", menu=fr)
+        view.add_separator()
+        self._aspect_var = tk.BooleanVar(value=self.keep_aspect)
+        view.add_checkbutton(label="Keep aspect ratio", variable=self._aspect_var, command=self._apply_aspect)
+        self._intscale_var = tk.BooleanVar(value=self.integer_scale)
+        view.add_checkbutton(label="Integer scaling", variable=self._intscale_var, command=self._apply_intscale)
         menubar.add_cascade(label="View", menu=view)
 
         # Audio menu
@@ -3168,13 +3196,21 @@ class GameApp(tk.Tk):
     def _apply_fpscap(self) -> None:
         self.target_fps = self._fpscap_var.get()
 
+    def _apply_aspect(self) -> None:
+        self.keep_aspect = self._aspect_var.get()
+
+    def _apply_intscale(self) -> None:
+        self.integer_scale = self._intscale_var.get()
+
     def _apply_sound(self) -> None:
         self.world.sound.sound_enabled = self._sound_var.get()
 
     def _apply_music(self) -> None:
         en = self._music_var.get()
         self.world.sound.music_enabled = en
-        if not en:
+        if en:
+            self.world.sound.resume_music()
+        else:
             self.world.sound.stop_music()
 
     def _apply_difficulty(self) -> None:
@@ -3254,18 +3290,26 @@ class GameApp(tk.Tk):
     def _present(self, alpha: float | None) -> None:
         img = self.world.render_frame(debug_overlay=False, alpha=alpha)
         self._last_cam = self.world._last_cam
-        if self.scale != 1:
-            img = img.resize((DOS_W * self.scale, DOS_H * self.scale), Image.Resampling.NEAREST)
-        # Reuse the PhotoImage buffer (paste) instead of allocating a new one
-        # each frame -- a large win in the PIL -> Tk pipeline.
-        if self.photo is None or self.photo.width() != img.width or self.photo.height() != img.height:
+        win_w = max(1, self.canvas.winfo_width())
+        win_h = max(1, self.canvas.winfo_height())
+        out_w, out_h = self._display_size(win_w, win_h)
+        if (out_w, out_h) != (DOS_W, DOS_H):
+            img = img.resize((out_w, out_h), Image.Resampling.NEAREST)
+        off_x = (win_w - out_w) // 2
+        off_y = (win_h - out_h) // 2
+        self._disp = (off_x, off_y, out_w / DOS_W, out_h / DOS_H)
+        # Reuse the PhotoImage buffer (paste) unless its size changed -- a large
+        # win in the PIL -> Tk pipeline.
+        if self.photo is None or self._photo_size != (out_w, out_h):
             self.photo = ImageTk.PhotoImage(img)
+            self._photo_size = (out_w, out_h)
             if self.canvas_image is None:
-                self.canvas_image = self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
+                self.canvas_image = self.canvas.create_image(off_x, off_y, anchor="nw", image=self.photo)
             else:
                 self.canvas.itemconfig(self.canvas_image, image=self.photo)
         else:
             self.photo.paste(img)
+        self.canvas.coords(self.canvas_image, off_x, off_y)
 
         # FPS / TPS measurement.
         self._fps_frames += 1
@@ -3285,32 +3329,34 @@ class GameApp(tk.Tk):
         for item in self._overlay_items:
             self.canvas.delete(item)
         self._overlay_items.clear()
-        s = self.scale
+        off_x, off_y, sx, sy = self._disp
         if self.show_fps:
             text = self._fps_text or "-- fps   -- tps"
             self._overlay_items.append(
-                self.canvas.create_text(5, 4, anchor="nw", text=text, fill="#00ff00",
-                                        font=("Consolas", 9, "bold")))
+                self.canvas.create_text(off_x + 5, off_y + 4, anchor="nw", text=text,
+                                        fill="#00ff00", font=("Consolas", 9, "bold")))
         if self.show_debug:
-            self._draw_debug_overlay_items(s)
+            self._draw_debug_overlay_items(off_x, off_y, sx, sy)
 
-    def _draw_debug_overlay_items(self, s: int) -> None:
+    def _draw_debug_overlay_items(self, off_x: float, off_y: float, sx: float, sy: float) -> None:
         p = self.world.player
         cam_x, cam_y = self._last_cam
-        sx = (p.x - cam_x) * s
-        sy = (p.y - cam_y) * s
+
+        def scr(wx, wy):  # world -> screen
+            return off_x + (wx - cam_x) * sx, off_y + (wy - cam_y) * sy
+
+        px0, py0 = scr(p.x, p.y)
         dx = 9 if p.vx > 0 else (-9 if p.vx < 0 else 0)
-        px = sx + dx * s
-        top = sy - p.collision_h * s
+        probe_x = px0 + dx * sx
+        top = py0 - p.collision_h * sy
         add = self._overlay_items.append
-        add(self.canvas.create_line(sx - 4 * s, sy, sx + 4 * s, sy, fill="#ff0000"))
-        add(self.canvas.create_line(sx, sy - 4 * s, sx, sy + 4 * s, fill="#ff0000"))
-        add(self.canvas.create_line(px, sy, px, top, fill="#00ffff"))
-        tx = (p.x >> 4) * 16 * s - cam_x * s
-        ty = (p.y >> 4) * 16 * s - cam_y * s
-        add(self.canvas.create_rectangle(tx, ty, tx + 16 * s, ty + 16 * s, outline="#ffff00"))
+        add(self.canvas.create_line(px0 - 4 * sx, py0, px0 + 4 * sx, py0, fill="#ff0000"))
+        add(self.canvas.create_line(px0, py0 - 4 * sy, px0, py0 + 4 * sy, fill="#ff0000"))
+        add(self.canvas.create_line(probe_x, py0, probe_x, top, fill="#00ffff"))
+        tx0, ty0 = scr((p.x >> 4) * 16, (p.y >> 4) * 16)
+        add(self.canvas.create_rectangle(tx0, ty0, tx0 + 16 * sx, ty0 + 16 * sy, outline="#ffff00"))
         add(self.canvas.create_text(
-            5, DOS_H * s - 14, anchor="sw", fill="#ffffff", font=("Consolas", 8),
+            off_x + 5, off_y + DOS_H * sy - 14, anchor="sw", fill="#ffffff", font=("Consolas", 8),
             text=(f"L{self.world.level.level_id} t={self.world.tick_count} "
                   f"pos=({p.x},{p.y}) v=({p.vx},{p.vy}) g={int(p.on_ground)} "
                   f"spr={p.spr_num & 0x1FFF} anim={p.current_anim_num} noj={p.nojump_counter}")))
