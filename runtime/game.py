@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 import tkinter as tk
 from dataclasses import dataclass
@@ -353,7 +354,7 @@ class RuntimeWorld:
     model so editor code does not become gameplay code.
     """
 
-    def __init__(self, project_dir: Path, data_dir: Path, level_index: int = 0) -> None:
+    def __init__(self, project_dir: Path, data_dir: Path, level_index: int = 0, *, audio_debug: bool = False) -> None:
         self.project_dir = project_dir
         self.data_dir = data_dir
         self.resource_dir = project_dir / "resources"
@@ -378,7 +379,7 @@ class RuntimeWorld:
         self.front_cache: dict[int, list[int]] = {}
         self.sprite_cache: dict[tuple[int, int], Image.Image] = {}
         self.prng = Pre2Prng()
-        self.sound = SoundEngine(data_dir)
+        self.sound = SoundEngine(data_dir, debug=audio_debug)
         # blues player_jump_monster_flag / monster.collide_y_dist, written by the
         # collide primitive and read by the player-monster collision stomp branch.
         self._jump_monster_flag = 0
@@ -406,6 +407,10 @@ class RuntimeWorld:
         self.level_index = level_index % len(LEVEL_IDS)
         self.level = load_level(self.data_dir, self.level_index)
         self.runtime_tilemap = bytearray(self.level.tilemap)
+        # Incremented whenever gameplay mutates a tile. Renderers can use this
+        # to update cached tile layers instead of rebuilding the visible map.
+        self._tilemap_version = 0
+        self._tile_dirty_positions: list[tuple[int, int]] = []
         self._init_secret_bonus_tiles()
         self.decor_tile0_offset: int | None = None
         self.palette = self.palettes[self.level_index]
@@ -645,7 +650,13 @@ class RuntimeWorld:
         tx = offset & 0xFF
         ty = offset >> 8
         if 0 <= tx < self.level.width_tiles and 0 <= ty < self.level.height_tiles:
-            self.runtime_tilemap[ty * self.level.width_tiles + tx] = tile_num & 0xFF
+            idx = ty * self.level.width_tiles + tx
+            new_tile = tile_num & 0xFF
+            if self.runtime_tilemap[idx] != new_tile:
+                self.runtime_tilemap[idx] = new_tile
+                self._tilemap_version = getattr(self, "_tilemap_version", 0) + 1
+                if hasattr(self, "_tile_dirty_positions"):
+                    self._tile_dirty_positions.append((tx, ty))
 
     def tile_num_at_pixel(self, x: int, y: int) -> int | None:
         return self.tile_num_at_tile(x // TILE, y // TILE)
@@ -3393,6 +3404,8 @@ class RuntimeWorld:
         return int(prev + d * a)
 
     def render_frame(self, *, debug_overlay: bool = False, alpha: float | None = None) -> Image.Image:
+        if self._map_intro is not None:
+            return self._render_map_intro()
         if self._complete is not None:
             return self._render_complete()
         interp = alpha is not None
@@ -3627,11 +3640,11 @@ class RuntimeWorld:
 
 
 class GameApp(tk.Tk):
-    def __init__(self, project_dir: Path, data_dir: Path, level_index: int = 0, scale: int = 3) -> None:
+    def __init__(self, project_dir: Path, data_dir: Path, level_index: int = 0, scale: int = 3, *, audio_debug: bool = False) -> None:
         super().__init__()
         self.title("Prehistorik 2 runtime RE - run_game")
         self.scale = max(1, int(scale))
-        self.world = RuntimeWorld(project_dir, data_dir, level_index)
+        self.world = RuntimeWorld(project_dir, data_dir, level_index, audio_debug=audio_debug)
         self.input = InputState()
         self.running = True
         self.show_debug = False  # F1 / Develop menu toggles the debug overlay
@@ -3926,14 +3939,34 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("game_data", nargs="?", default="game_data", help="Folder containing original PRE2 game data")
     parser.add_argument("--level", type=int, default=1, help="1-based level number/ID index, default: 1")
     parser.add_argument("--scale", type=int, default=3, help="Integer nearest-neighbour window scale")
+    parser.add_argument("--backend", choices=("auto", "pygame", "tk"), default="auto",
+                        help="Rendering backend: pygame/SDL2 when available, or the original Tk/Pillow path")
+    parser.add_argument("--fps", type=int, default=60, help="Target FPS for pygame interpolation mode")
+    parser.add_argument("--audio-debug", action="store_true", help="Print pygame mixer/SFX diagnostics to stderr")
     args = parser.parse_args(argv)
 
     project_dir = Path(__file__).resolve().parent.parent
     data_dir = Path(args.game_data)
     if not data_dir.is_absolute():
         data_dir = project_dir / data_dir
+    level_index = max(0, args.level - 1)
+    if args.backend in ("auto", "pygame"):
+        try:
+            from runtime.pygame_backend import run_pygame_app
+            return run_pygame_app(project_dir, data_dir, level_index, args.scale, args.fps, audio_debug=args.audio_debug)
+        except ImportError as exc:
+            if args.backend == "pygame":
+                raise
+            print(f"pygame backend unavailable ({exc}); falling back to Tk/Pillow", file=sys.stderr)
+        except Exception as exc:
+            if args.backend == "pygame":
+                raise
+            # If the accelerated backend fails during display initialisation, keep
+            # the old path usable rather than refusing to launch.
+            print(f"pygame backend failed ({exc}); falling back to Tk/Pillow", file=sys.stderr)
+
     try:
-        app = GameApp(project_dir, data_dir, max(0, args.level - 1), args.scale)
+        app = GameApp(project_dir, data_dir, level_index, args.scale, audio_debug=args.audio_debug)
     except Exception as exc:
         messagebox.showerror("run_game failed to start", str(exc))
         raise
