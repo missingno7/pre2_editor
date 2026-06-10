@@ -23,6 +23,9 @@ from runtime.game import (
     LEVEL_IDS,
     InputState,
     RuntimeWorld,
+    COS_TBL,
+    SIN_TBL,
+    _s8,
     _BLINK_BLACK,
     _BLINK_WHITE,
 )
@@ -45,6 +48,8 @@ class PygameSurfaceRenderer:
         self._asset_generation: tuple[int, int] | None = None
         self._bg_surface: Any | None = None
         self._map_surface: Any | None = None
+        self._intro_surface_key: int | None = None
+        self._intro_surface: Any | None = None
         self._motif_tiled_surface: Any | None = None
         self._mode_letter_surfaces: dict[int, Any] = {}
         self._panel_bg_surface: Any | None = None
@@ -61,6 +66,8 @@ class PygameSurfaceRenderer:
         self._asset_generation = None
         self._bg_surface = None
         self._map_surface = None
+        self._intro_surface_key = None
+        self._intro_surface = None
         self._motif_tiled_surface = None
         self._mode_letter_surfaces.clear()
         self._panel_bg_surface = None
@@ -85,7 +92,10 @@ class PygameSurfaceRenderer:
         return surf.convert_alpha() if alpha else surf.convert()
 
     def _sync_assets(self) -> None:
-        generation = (self.world.level_index, id(self.world.level))
+        # Include the palette generation so the light/sun fade (which mutates the
+        # active level palette each tick) re-bakes the cached colour surfaces.
+        generation = (self.world.level_index, id(self.world.level),
+                      getattr(self.world, "_palette_gen", 0))
         if generation == self._asset_generation:
             return
         self._asset_generation = generation
@@ -343,6 +353,9 @@ class PygameSurfaceRenderer:
         for i in range(5):
             if (p.bonus_letters_mask >> i) & 1:
                 self._draw_panel_number(target, bonus_pos[i], 12 + i)
+        # Boss energy pips: screen-fixed, mirrors game.py _draw_hud.
+        for i in range(getattr(self.world, "_boss_energy_count", 0)):
+            self._draw_sprite(target, 0x135, 8 + i * 5, 170, camera=(0, 0))
 
     def _draw_transition(self, target: Any, alpha: float) -> None:
         w = self.world
@@ -358,6 +371,25 @@ class PygameSurfaceRenderer:
             left = int(max(0, (1.0 - t / 12.0) * (DOS_W // 2)))
             self.pg.draw.rect(target, (0, 0, 0), (0, 0, left, PLAY_H))
             self.pg.draw.rect(target, (0, 0, 0), (DOS_W - left, 0, left, PLAY_H))
+
+    def _render_intro(self, alpha: float | None = None) -> Any:
+        img = self.world._render_intro()
+        key = id(img)  # copy id changes; use original frame from state instead if available
+        intro = self.world._intro
+        if intro is not None:
+            stage = int(intro["stage"])
+            frame = intro["stages"][stage].get("frame")
+            key = id(frame)
+            if self._intro_surface_key != key:
+                self._intro_surface = self._surface_from_pil(frame if isinstance(frame, Image.Image) else img, alpha=False)
+                self._intro_surface_key = key
+        elif self._intro_surface_key != key:
+            self._intro_surface = self._surface_from_pil(img, alpha=False)
+            self._intro_surface_key = key
+        self.frame.fill((0, 0, 0))
+        if self._intro_surface is not None:
+            self.frame.blit(self._intro_surface, (0, 0))
+        return self.frame
 
     def _render_mode_select(self, alpha: float | None = None) -> Any:
         w = self.world
@@ -407,6 +439,20 @@ class PygameSurfaceRenderer:
             self._draw_sprite(self.frame, m["marker_spr"], mx, MAP_MARKER_Y, camera=(0, 0))
         return self.frame
 
+    def _draw_orbs(self, target: Any, cam_x: int, cam_y: int) -> None:
+        # One-frame white spider-web/orb trail pixels from blues orb_tbl[20].
+        # Do not mutate here: render interpolation can draw more than once per
+        # logic tick, while the runtime clears and regenerates the particles.
+        white = self.world.rgb[15] if getattr(self.world, "rgb", None) else (255, 255, 255)
+        for orb in getattr(self.world, "orb_states", []):
+            if not orb.active:
+                continue
+            a = orb.index_tbl & 0xFF
+            x = orb.x + (((_s8(COS_TBL[a]) >> 2) * orb.radius) >> 4) - int(cam_x)
+            y = orb.y + (((_s8(SIN_TBL[a]) >> 2) * orb.radius) >> 4) - int(cam_y)
+            if 0 <= x < DOS_W and 0 <= y < PLAY_H:
+                target.set_at((x, y), white)
+
     def _render_complete(self, alpha: float | None = None) -> Any:
         self.frame.fill((0, 0, 0))
         w = self.world
@@ -439,6 +485,12 @@ class PygameSurfaceRenderer:
     def render(self, alpha: float | None = None) -> Any:
         self._sync_assets()
         w = self.world
+        if w._the_end is not None:
+            surf = self._surface_from_pil(w.render_frame(alpha=alpha), alpha=False)
+            self.frame.blit(surf, (0, 0))
+            return self.frame
+        if w._intro is not None:
+            return self._render_intro(alpha)
         if w._mode_select is not None:
             return self._render_mode_select(alpha)
         if w._map_intro is not None:
@@ -471,25 +523,36 @@ class PygameSurfaceRenderer:
                 py = w._lerp(platform.prev_y, platform.y, a) if interp else platform.y
                 self._draw_sprite(self.frame, runtime_num, px, py, camera=(cam_x, cam_y))
 
-        for obj in w.runtime_objects:
-            if obj.active and abs(obj.x - cam_x) < DOS_W + 160 and abs(obj.y - cam_y) < DOS_H + 160:
-                tint = None
-                if 11 <= obj.slot <= 22 and obj.hit_flash > 0:
-                    tint = _BLINK_WHITE
-                elif 23 <= obj.slot <= 54 and obj.ttl > 0 and (w.tick_count & 1):
-                    tint = _BLINK_BLACK
-                same = obj.iact and obj.iref == (obj.ref_index if obj.ref_index is not None else -1)
-                if interp and same:
-                    ox = w._lerp(obj.ipx, obj.x, a)
-                    oy = w._lerp(obj.ipy, obj.y, a)
-                else:
-                    ox, oy = obj.x, obj.y
-                self._draw_sprite(self.frame, obj.spr_num, ox, oy, tint=tint, camera=(cam_x, cam_y))
+        self._draw_orbs(self.frame, int(cam_x), int(cam_y))
+
+        # DOS level_draw_objects iterates slots HIGH -> LOW: higher slots are BEHIND
+        # (gorilla parts 103-107 stack with 103 in front; the player draws over all
+        # objects except the club/wing overlay slot 0, the top-most sprite).
+        def draw_object(obj):
+            if not (obj.active and abs(obj.x - cam_x) < DOS_W + 160 and abs(obj.y - cam_y) < DOS_H + 160):
+                return
+            tint = None
+            if (11 <= obj.slot <= 22 and obj.hit_flash > 0) or (obj.spr_num & 0x4000):
+                tint = _BLINK_WHITE  # hit enemy/boss flashes white
+            elif 23 <= obj.slot <= 54 and obj.ttl > 0 and (w.tick_count & 1):
+                tint = _BLINK_BLACK
+            same = obj.iact and obj.iref == (obj.ref_index if obj.ref_index is not None else -1)
+            if interp and same:
+                ox = w._lerp(obj.ipx, obj.x, a)
+                oy = w._lerp(obj.ipy, obj.y, a)
+            else:
+                ox, oy = obj.x, obj.y
+            self._draw_sprite(self.frame, obj.spr_num, ox, oy, tint=tint, camera=(cam_x, cam_y))
+
+        for slot in range(len(w.runtime_objects) - 1, 1, -1):
+            draw_object(w.runtime_objects[slot])
 
         player_tint = _BLINK_BLACK if (w.player.hit_counter > 0 and (w.tick_count & 1)) else None
         ppx = w._lerp(w.player.ipx, w.player.x, a) if interp else w.player.x
         ppy = w._lerp(w.player.ipy, w.player.y, a) if interp else w.player.y
         self._draw_sprite(self.frame, w._player_sprite_num(), ppx, ppy, tint=player_tint, camera=(cam_x, cam_y))
+        # Club / glider-wing overlay (slot 0) draws on top of the player.
+        draw_object(w.runtime_objects[0])
 
         self._draw_front_chunks(cam_x, cam_y)
 
@@ -628,6 +691,10 @@ class PygameGameApp:
         self.world.expert = bool(expert)
         self._restart_level()
 
+    def _toggle_camera_mode(self) -> None:
+        new_mode = "vanilla" if self.world.camera_mode != "vanilla" else "smooth"
+        self.world.set_camera_mode(new_mode)
+
     def _toggle_music(self) -> None:
         self.world.sound.music_enabled = not self.world.sound.music_enabled
         if self.world.sound.music_enabled:
@@ -665,6 +732,7 @@ class PygameGameApp:
             cap = "Uncapped" if self.target_fps <= 0 else f"{self.target_fps} FPS"
             return [
                 {"label": "Interpolation", "value": "On" if self.interpolate else "Off", "activate": lambda: setattr(self, "interpolate", not self.interpolate)},
+                {"label": "Camera", "value": "Vanilla" if self.world.camera_mode == "vanilla" else "Smooth", "activate": self._toggle_camera_mode},
                 {"label": "FPS / TPS overlay", "value": "On" if self.show_fps else "Off", "activate": lambda: setattr(self, "show_fps", not self.show_fps)},
                 {"label": "Frame cap", "value": cap, "adjust": self._set_cap_relative, "activate": lambda: self._set_cap_relative(1)},
                 {"label": "Keep aspect ratio", "value": "On" if self.keep_aspect else "Off", "activate": lambda: setattr(self, "keep_aspect", not self.keep_aspect)},
@@ -684,6 +752,7 @@ class PygameGameApp:
             {"label": "F1", "value": "debug overlay"},
             {"label": "F2", "value": "FPS / TPS overlay"},
             {"label": "F3", "value": "interpolation"},
+            {"label": "F4", "value": "smooth / vanilla camera"},
             {"label": "[ / ]", "value": "previous / next level"},
             {"label": "R", "value": "restart level"},
             {"label": "F8", "value": "test sound effect"},
@@ -748,6 +817,8 @@ class PygameGameApp:
             self.show_fps = not self.show_fps
         elif event.key == pg.K_F3:
             self.interpolate = not self.interpolate
+        elif event.key == pg.K_F4:
+            self._toggle_camera_mode()
         elif event.key == pg.K_F8:
             self.world.sound.play_next_test_sound()
         elif event.key == pg.K_r:
@@ -874,7 +945,7 @@ class PygameGameApp:
             row_y += row_h
 
         help1 = "Up/Down select   Left/Right adjust or switch tab   Enter activate"
-        help2 = "F1 debug   F2 FPS   F3 interpolation   [/] level   R restart   F8 SFX   Esc close"
+        help2 = "F1 debug   F2 FPS   F3 interp   F4 camera   [/] level   R restart   F8 SFX   Esc close"
         self._draw_text(help1, x + 16, y + panel_h - 42, font=self._font_small, color=(210, 210, 210), shadow=False)
         self._draw_text(help2, x + 16, y + panel_h - 22, font=self._font_small, color=(210, 210, 210), shadow=False)
 
@@ -902,7 +973,8 @@ class PygameGameApp:
             tps = (self.world.tick_count - self._fps_ticks0) / dt
             backend = "pygame/SDL2"
             mode = "interp" if self.interpolate else "tick"
-            self._fps_text = f"{fps:3.0f} fps   {tps:3.0f} tps   {backend}   {mode}"
+            cam = "vanilla-cam" if self.world.camera_mode == "vanilla" else "smooth-cam"
+            self._fps_text = f"{fps:3.0f} fps   {tps:3.0f} tps   {backend}   {mode}   {cam}"
             self._fps_t0 = time.perf_counter()
             self._fps_frames = 0
             self._fps_ticks0 = self.world.tick_count

@@ -1,17 +1,27 @@
-# Runtime rendering backends
+# Runtime rendering backend
 
-`run_game.py` now supports two presentation paths:
-
-- `--backend pygame` — pygame/SDL2 backend. Gameplay is still the same fixed-tick `RuntimeWorld`, but rendering is done directly with cached pygame surfaces and SDL2 scaled presentation instead of Pillow -> Tk `PhotoImage` every frame.
-- `--backend tk` — old Tk/Pillow backend, kept as a fallback and for comparison.
-- `--backend auto` — default. It tries pygame first and falls back to Tk if pygame is not installed or the SDL display cannot initialise.
+`run_game.py` renders with the **pygame/SDL2 backend only**. Gameplay is the
+fixed-tick `RuntimeWorld`; rendering converts decoded tiles, sprites, HUD glyphs and
+backgrounds to pygame surfaces (cached per level) and presents them scaled by SDL2
+(`pygame.SCALED`). (The original Tk/Pillow game backend was removed; Tk lives on only
+in the separate level editor, `gui.py`.)
 
 Recommended launch:
 
 ```bash
 pip install -r requirements.txt
-python run_game.py --backend pygame --scale 3 --level 1
+python run_game.py --scale 3 --level 1
 ```
+
+### IMPORTANT: two render paths to keep in sync
+
+`runtime/pygame_backend.py` (`PygameSurfaceRenderer`) is a native renderer that
+duplicates the draw code in `runtime/game.py` `RuntimeWorld.render_frame` (the PIL
+renderer, kept for headless tests). Animation/game **state** lives in `game.py`
+(shared), but the **draw** code is duplicated. When changing any render path (intro,
+mode-select, map, bonus screen, wipes, HUD, light fade, etc.) update BOTH and test
+the pygame one headlessly: `SDL_VIDEODRIVER=dummy`, `pygame.display.set_mode`,
+`PygameSurfaceRenderer(world, pygame).render(alpha)` then `pygame.image.save`.
 
 Useful keys in the pygame backend:
 
@@ -21,13 +31,19 @@ Useful keys in the pygame backend:
 - `F1`: debug collision/probe overlay
 - `F2`: FPS/TPS overlay
 - `F3`: interpolation on/off
+- `F4`: smooth/vanilla camera toggle
 - `[` / `]`: previous/next level
 - `R`: restart level
 - `Esc`: quit
 
-## Why this is faster
+## Why surfaces are cached
 
-The old path creates a Pillow image for the DOS viewport, optionally resizes it on the CPU, and then uploads it into Tk.  The pygame backend converts decoded tiles, sprites, HUD glyphs, and backgrounds to pygame surfaces once per level and then reuses those surfaces.  With `pygame.SCALED`, SDL2 handles the final 320x200-to-window scaling outside Pillow/Tk, which is the part that is most likely to benefit from GPU/driver acceleration.
+The PIL path creates a Pillow image for the DOS viewport, optionally resizes it on
+the CPU, and uploads it.  The pygame backend converts decoded tiles, sprites, HUD
+glyphs, and backgrounds to pygame surfaces once per level and reuses them.  With
+`pygame.SCALED`, SDL2 handles the final 320x200-to-window scaling, which benefits
+from GPU/driver acceleration.  Cached surfaces are keyed by `(level_index, level id,
+palette generation)` so the sun/light palette fade re-bakes them.
 
 ## Local smoke benchmark
 
@@ -56,7 +72,7 @@ the active mixer format without requiring numpy.
 Useful checks:
 
 ```bash
-python run_game.py --backend pygame --audio-debug
+python run_game.py --audio-debug
 ```
 
 While the pygame window is focused, press **F8** to cycle through the raw sound

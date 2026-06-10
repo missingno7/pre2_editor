@@ -22,7 +22,7 @@ class Pattern:
 
 
 PATTERNS = [
-    Pattern("PRNG seed", bytes.fromhex("05 22 86 8D E5"), "Matches p2/resource.c random seed state."),
+    Pattern("PRNG seed byte run", bytes.fromhex("05 22 86 8D E5"), "Known false-positive: the hit at 0x79D1 is code bytes, not confirmed PRNG state."),
     Pattern("player_anim_lut", bytes.fromhex("00 03 05 07 02 06 00 00 01 03 04 07 02 06 01 00 01 03 04 07 02 06 00 00 00 00 00 00 00 00 00 00"), "Expected from p2/staticres.c; no direct flat match so far."),
     Pattern("jump y_tbl int8", bytes.fromhex("BF CD DD EC F6 FB FE FF 00"), "Expected signed bytes -65,-51,-35,-20,-10,-5,-2,-1,0."),
     Pattern("jump y_tbl int16", bytes.fromhex("BF FF CD FF DD FF EC FF F6 FF FB FF FE FF FF FF 00 00"), "Same values as little-endian int16 words."),
@@ -53,7 +53,8 @@ def main() -> int:
         if matches:
             locs = ", ".join(f"0x{x:05X}" for x in matches[:12])
             more = "" if len(matches) <= 12 else f" ... +{len(matches)-12} more"
-            print(f"OK   {pat.name:22s} {locs}{more}  # {pat.note}")
+            status = "WARN" if "false-positive" in pat.note else "OK  "
+            print(f"{status} {pat.name:22s} {locs}{more}  # {pat.note}")
         else:
             print(f"MISS {pat.name:22s} --  # {pat.note}")
     return 0

@@ -15,6 +15,14 @@ class Pre2Prng:
         self.tmp2 = 0x22
         self.tmp3 = 0x86
         self.tmp4 = 0xE58D
+        # random_get_number2 state (blues g_vars.random.e; game_run seeds 0x1234).
+        self.e = 0x1234
+
+    def next_u16_2(self) -> int:
+        """blues random_get_number2: e = ror16(e + 0x9248, 3)."""
+        x = (self.e + 0x9248) & 0xFFFF
+        self.e = ((x >> 3) | (x << 13)) & 0xFFFF
+        return self.e
 
     def next_u8(self) -> int:
         self.tmp4 = (self.tmp4 + self.tmp1) & 0xFFFF

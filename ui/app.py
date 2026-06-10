@@ -1380,11 +1380,32 @@ class Pre2EditorApp(tk.Tk):
         self.file_preview_canvas = ScrollableCanvas(visual_tab, bg="#202020")
         self.file_preview_canvas.pack(fill="both", expand=True)
 
+        calibrate_bar = ttk.Frame(passwords_tab)
+        calibrate_bar.pack(side="top", fill="x", pady=(0, 6))
+        ttk.Label(calibrate_bar, text="Calibrate from observed level-1 BEGINNER password:").pack(side="left")
+        self.password_calibrate_var = tk.StringVar()
+        ttk.Entry(calibrate_bar, textvariable=self.password_calibrate_var, width=6).pack(side="left", padx=4)
+        ttk.Button(calibrate_bar, text="Apply", command=self._calibrate_passwords).pack(side="left")
+        ttk.Button(calibrate_bar, text="Reset (stock DOSBox)", command=self._reset_password_multiplier).pack(side="left", padx=4)
+
         self.passwords_text = tk.Text(passwords_tab, wrap="none", state="disabled", font=("Consolas", 10))
         self.passwords_text.pack(side="left", fill="both", expand=True)
         passwords_yscroll = ttk.Scrollbar(passwords_tab, orient="vertical", command=self.passwords_text.yview)
         passwords_yscroll.pack(side="right", fill="y")
         self.passwords_text.configure(yscrollcommand=passwords_yscroll.set)
+        self._refresh_passwords_tab()
+
+    def _calibrate_passwords(self) -> None:
+        from pre2lib.passwords import derive_machine_multiplier
+        try:
+            self.password_multiplier = derive_machine_multiplier(self.password_calibrate_var.get())
+        except ValueError as exc:
+            messagebox.showerror("Password calibration", str(exc))
+            return
+        self._refresh_passwords_tab()
+
+    def _reset_password_multiplier(self) -> None:
+        self.password_multiplier = None
         self._refresh_passwords_tab()
 
     def _choose_folder(self) -> None:
@@ -3561,18 +3582,29 @@ class Pre2EditorApp(tk.Tk):
         if not hasattr(self, "passwords_text"):
             return
         glyph_counts = self._level_password_glyph_counts()
+        from pre2lib.passwords import DEFAULT_MACHINE_MULTIPLIER
+        multiplier = getattr(self, "password_multiplier", None) or DEFAULT_MACHINE_MULTIPLIER
         lines = [
             "Level passwords",
             "",
             "The game does not store final passwords as text in LEVEL*.SQZ.",
             "On level load it finds item sprites 283..298 (0-9/A-F), sorts them by X position,",
-            "then writes the 4 nibbles from random_get_number3(level_index + difficulty_offset).",
-            "Beginner uses offset 0; Expert uses offset 10. Level index is the game's internal 0-based level number.",
+            "then writes the 4 nibbles of ROL16((seed ^ 0x55A3) * MACHINE_VALUE, 3),",
+            "seed = level_index + (10 for Expert). (PRE2_main.bin routine at 0x9559.)",
+            "",
+            "IMPORTANT: MACHINE_VALUE is a checksum of the emulated BIOS bytes",
+            "(F000:FFF0..FFFF) plus the first 128 bytes of each option ROM (video BIOS),",
+            "so passwords DIFFER between DOSBox versions/forks/machine= settings.",
+            "If these don't match your game: play level 1 (Beginner), note the password",
+            "shown in-game, and calibrate above to recompute the whole table.",
+            "",
+            f"Machine multiplier in use: 0x{multiplier:04X}"
+            + ("  (calibrated)" if getattr(self, "password_multiplier", None) else "  (stock DOSBox default)"),
             "",
             "Level  Beginner  Expert  Glyphs in LEVEL*.SQZ",
             "-----  --------  ------  -------------------",
         ]
-        for row in all_level_passwords():
+        for row in all_level_passwords(multiplier):
             glyph_count = glyph_counts.get(row.level_index)
             if glyph_count is None:
                 glyph_note = "level file missing/unreadable"
@@ -3587,8 +3619,8 @@ class Pre2EditorApp(tk.Tk):
         lines.extend(
             [
                 "",
-                "Source: reverse-engineered blues/p2 level loader:",
-                "random_get_number3(seed) = rol16(((seed ^ 0x55A3) * 0xB297) & 0xFFFF, 3).",
+                "Source: PRE2.EXE inner main program (disasm/PRE2_main.bin, routine 0x9559),",
+                "recovered via tools/unlzexe.py + tools/unpack_inner_eat.py.",
             ]
         )
         self._set_passwords_text("\n".join(lines))

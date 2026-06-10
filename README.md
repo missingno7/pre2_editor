@@ -73,13 +73,13 @@ The editor is already useful for tile/object layout work and can save those edit
 
 ## Gameplay reverse-engineering runtime
 
-A second launcher now exists next to the editor.  It now defaults to the pygame/SDL2 renderer when pygame is installed, with the older Tk/Pillow renderer kept as a fallback:
+A second launcher runs the reverse-engineered **game** (not the editor). The game
+uses the pygame/SDL2 renderer only — install it with `pip install pygame`:
 
 ```bash
 python run_game.py [game_data_folder]
-python run_game.py --backend pygame --scale 3 --level 1
-python run_game.py --backend pygame --audio-debug   # print mixer/SFX diagnostics
-python run_game.py --backend tk --scale 3 --level 1
+python run_game.py --scale 3 --level 1
+python run_game.py --audio-debug   # print mixer/SFX diagnostics
 ```
 
 See `docs/RENDERING_BACKENDS.md` for the renderer notes and benchmarking details.
@@ -91,20 +91,30 @@ Controls:
 - `Enter` action,
 - `[` / `]` switch levels,
 - `R` reloads current level,
-- `F1` toggles the runtime debug overlay,
-- `F2` toggles FPS/TPS in the pygame backend,
-- `F3` toggles interpolation in the pygame backend,
+- `F1` debug overlay, `F2` FPS/TPS, `F3` interpolation toggle,
+- `F4` camera mode (vanilla is the default; smooth is the optional modern feel),
+- `F8` cycle/test raw SAMPLE.SQZ sound effects,
 - `Esc` exits.
 
-`run_game.py` is intentionally separate from `gui.py`.  The editor stays an asset/level authoring tool, while `runtime/game.py` contains mutable gameplay state and the reverse-engineered tick loop.  The current runtime bootstrap already uses original `LEVEL*.SQZ`, `UNION.SQZ`, `FRONT.SQZ`, `BACK*.SQZ`, `SPRITES.SQZ`, palettes, sprite tables, tile collision attributes, integer physics, and a 19 Hz DOS-style simulation tick.  Enemy/platform/item logic is still mostly visual/static scaffolding and is the next place to replace approximations with disassembly-backed behavior.
+`run_game.py` is intentionally separate from `gui.py`.  The editor stays an
+asset/level authoring tool, while `runtime/game.py` is the reverse-engineered game:
+mutable gameplay state, a fixed-timestep tick loop at the measured DOS rate
+(`TICK_HZ ≈ 21.8`) with render interpolation, original `LEVEL*.SQZ`, `UNION.SQZ`,
+`FRONT.SQZ`, `BACK*.SQZ`, `SPRITES.SQZ`, `MAP/MOTIF/MENU/...`, palettes, sprite
+tables, tile collision attributes, and integer physics.
+
+Implemented game flow: TITUS / "still working" easter-egg / PRESENT / MENU startup
+screens, BEGINNER-EXPERT mode select, the per-level "you are here" map intro, the
+level-entry curtain and level-exit iris wipes, gameplay (player physics, club, the
+glider flight state, monsters/AI, secrets, bonuses, the sun/light palette fade, the
+level-E earthquake columns, auto-scroll levels), the three bosses (gorilla, level-5
+tree, level-9 minotaur), the level-completed bonus tally, and the THEEND screen.
+
+**Accuracy policy:** the original PRE2.EXE (disassembled in `disasm/`) is the only
+ground truth; the bundled `blues` C reimplementation under
+`reverse_engineering/reference/` is a guide and is *not* tick-accurate, so behaviour
+and constants are verified against the ASM. Remaining known inaccuracies (boss
+position tables, some const-segment data, the glider in-air flap control) are tracked
+in `reverse_engineering/notes/`.
 
 On case-sensitive filesystems, the loaders now resolve DOS uppercase data files case-insensitively, so the same code works with the original `LEVEL1.SQZ` style names.
-
-Gameplay runtime pygame controls:
-
-- `F1` debug overlay
-- `F2` FPS overlay
-- `F3` interpolation toggle
-- `F8` cycle/test raw SAMPLE.SQZ sound effects
-- `[` / `]` previous/next level
-- `R` reload level

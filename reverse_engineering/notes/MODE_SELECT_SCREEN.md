@@ -77,3 +77,26 @@ file 0x79D1, but no code ref to it was locatable to back out the base.
 Exact palette, scroll direction/speed, music track, and the precise key/confirm
 mapping are reconstructions. Verified end-to-end headlessly (mode -> confirm ->
 intro -> wipe -> play) in both renderers with no crash.
+
+## Startup/intro screens (TITUS / easter-egg / PRESENT / MENU) — FIXED
+
+blues game_run() order (verified): do_programmed_in_1992_screen() FIRST (only if
+system year >= 1996), then do_titus_screen() (TITUS.SQZ), play_music(3),
+do_present_screen() (PRESENT.SQZ), then do_menu() loop (MENU.SQZ: 1/space=start,
+2/down=password, 15s timeout=MENU2 demo).
+
+Major bug fixed: `_decode_vga256_screen` called `vga6_to_rgb(data[:768])`, but that
+helper only accepts a 48-byte (16-colour) level palette — with 768 bytes it raised
+and returned None, so TITUS/PRESENT/MENU all showed placeholder FALLBACK text. blues
+uses set_screen_palette(data, 0, 256, 6) (256-colour) then the chunky image at
+data+768. Now converts all 256 VGA6 colours; TITUS/PRESENT/MENU render correctly
+(match DOS screenshots).
+
+Added the "MY GAME IS STILL WORKING IN {year}" easter-egg as the first intro stage
+(year>=1996), using the 8x12 string font from the start of ALLFONTS.SQZ
+(glyph = char-0x30, minus 2 if >9) coloured with credits_palette_data. The '>' / '<'
+chars render as the font's dot/arrow/'!' glyphs exactly like DOS. Intro order is now
+YEAR -> TITUS -> PRESENT -> MENU -> mode-select; both renderers handle it.
+
+Still simplified vs blues: palette fades, the 15s MENU timeout -> MENU2 demo
+animation, and the 2=PASSWORD option (password entry not implemented).
